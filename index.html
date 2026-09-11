@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Tower Crane — Potain MCT 88 Simulation</title>
+<link rel="stylesheet" href="style.css" />
+<!-- Classic (non-module) Three.js builds: these run fine when index.html is
+     opened directly via file:// — ES modules + importmaps are blocked there. -->
+<script src="https://unpkg.com/three@0.128.0/build/three.min.js"></script>
+<script src="https://unpkg.com/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+</head>
+<body>
+<header class="topbar">
+  <div class="title-block">
+    <h1>TOWER CRANE — POTAIN MCT 88 SIMULATION</h1>
+    <p>Data-driven engineering prototype · Real crane: Potain MCT 88 (C25), 30 m jib &nbsp;|&nbsp; <span class="sim-tag">SIMULATED ENGINEERING CHECK — NOT A CERTIFIED LIFT PLAN</span></p>
+  </div>
+  <div class="top-controls">
+    <div class="mode-switch">
+      <button id="btnManual" class="mode-btn active">MANUAL CONTROL</button>
+      <button id="btnAuto" class="mode-btn">AUTOMATIC LIFT</button>
+    </div>
+    <div class="transport">
+      <button id="btnPlay" title="Play">▶ PLAY</button>
+      <button id="btnPause" title="Pause">⏸ PAUSE</button>
+      <button id="btnReset" title="Reset">↻ RESET</button>
+    </div>
+    <div class="speed-ctrl">
+      <label>Speed:</label>
+      <button class="speed-btn" data-speed="0.5">0.5x</button>
+      <button class="speed-btn active" data-speed="1">1x</button>
+      <button class="speed-btn" data-speed="2">2x</button>
+    </div>
+  </div>
+</header>
+
+<div id="warningBanner" class="warning-banner hidden"></div>
+
+<main class="layout">
+  <!-- LEFT: 3D VIEW -->
+  <section class="viewport-wrap">
+    <div id="viewport"></div>
+    <div class="camera-bar">
+      <button data-cam="top">TOP VIEW</button>
+      <button data-cam="persp" class="active">3D VIEW</button>
+      <button data-cam="site">SITE VIEW</button>
+      <button data-cam="crane">CRANE VIEW</button>
+      <button data-cam="hook">HOOK CAM</button>
+    </div>
+    <div class="legend">
+      <span><i class="swatch jib"></i>Jib / Trolley path</span>
+      <span><i class="swatch envelope"></i>Crane envelope</span>
+      <span><i class="swatch exclusion"></i>Exclusion zone</span>
+      <span><i class="swatch building"></i>Buildings</span>
+      <span><i class="swatch wind"></i>Wind</span>
+    </div>
+    <div id="opBox" class="op-box">
+      <div class="op-label">CURRENT OPERATION</div>
+      <div id="opStep" class="op-step">MANUAL — AWAITING INPUT</div>
+      <div id="opDetail" class="op-detail">Hoist / Trolley / Slew sliders are live</div>
+      <div class="lift-progress"><div id="liftBar"></div></div>
+    </div>
+  </section>
+
+  <!-- RIGHT: CONTROL PANEL -->
+  <aside class="panel">
+    <nav class="tabs">
+      <button data-tab="sim" class="active">SIMULATION</button>
+      <button data-tab="crane">REAL CRANE</button>
+      <button data-tab="chart">LOAD CHART</button>
+      <button data-tab="valid">VALIDATION</button>
+      <button data-tab="constr">CONSTRAINTS</button>
+      <button data-tab="twin">DIGITAL TWIN</button>
+    </nav>
+    <div class="tabpage active" data-page="sim">
+    <section class="card real-strip">
+      <h2>Real crane in this simulation</h2>
+      <div class="real-line">REAL CRANE: <b>Potain MCT 88</b> · JIB: <b id="rJibTop">30 m</b> · MAX 5 t · TIP (30 m) 2.70 t · M = 81 t·m</div>
+      <div class="fine">Model: capacity.js — capacityAt() per STARTER-KIT §1. Full source under REAL CRANE tab.</div>
+    </section>
+    <section class="card">
+      <h2>1 · Crane Motion (Manual)</h2>
+      <div class="slider-row">
+        <label>HOIST — hook height <b id="vHoist">24.0 m</b></label>
+        <input id="sHoist" type="range" min="2" max="46" step="0.5" value="24" />
+        <div class="hint">▲ Hoisting / ▼ Lowering</div>
+      </div>
+      <div class="slider-row">
+        <label>TROLLEY — radius <b id="vTrolley">20.0 m</b></label>
+        <input id="sTrolley" type="range" min="4" max="29" step="0.5" value="20" />
+        <div class="hint">◀ ▶ Trolley along jib (jib 30 m; sim clamped 4–29 m)</div>
+      </div>
+      <div class="slider-row">
+        <label>SLEW — angle <b id="vSlew">0°</b></label>
+        <input id="sSlew" type="range" min="-180" max="180" step="1" value="0" />
+        <div class="hint">⟳ Slew rotation about mast</div>
+      </div>
+      <div class="btn-row">
+        <button id="btnDemoLift">▶ START DEMONSTRATION LIFT</button>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>2 · Live Capacity Panel (capacityAt — real model)</h2>
+      <div class="real-line">REAL CRANE: <b>Potain MCT 88</b> · JIB: <b id="rJib">30 m</b></div>
+      <div class="readouts">
+        <div class="ro"><span>CURRENT LOAD</span><b id="rLoad">2.0 t</b></div>
+        <div class="ro"><span>CURRENT RADIUS</span><b id="rRadius">20.0 m</b></div>
+        <div class="ro"><span>HOOK HT</span><b id="rHook">24.0 m</b></div>
+      </div>
+      <div class="readouts">
+        <div class="ro"><span>CALCULATED CAPACITY</span><b id="rAllowed">— t</b></div>
+        <div class="ro"><span>LOAD MOMENT</span><b id="rModel">— t·m</b></div>
+        <div class="ro"><span>UTILIZATION</span><b id="rUtil">— %</b></div>
+      </div>
+      <div id="riskBadge" class="risk low">WITHIN CAPACITY</div>
+      <div class="fine">STATUS thresholds: &lt;0.90 SAFE · 0.90–&lt;1.00 WARNING · ≥1.00 DANGER.</div>
+      <div class="fine">SIMULATED ENGINEERING CHECK — NOT A CERTIFIED LIFT PLAN.</div>
+      <div class="fine" id="capStatusLine">STATUS: —</div>
+      <div class="fine" id="cornerLine">Corner radius: 16.2 m · Moment: 81 t·m · Source: MCT 88 datasheet (see REAL CRANE tab).</div>
+    </section>
+
+    <section class="card">
+      <h2>3 · Crane Operating Factors (simulated)</h2>
+      <div class="factor"><label>Load weight <b id="vLoad">2.0 t</b></label>
+        <input id="sLoad" type="range" min="0" max="5" step="0.1" value="2" /></div>
+      <div class="factor"><label>Jib length (installed, real configs 20–53.1 m) <b id="vJib">30 m</b></label>
+        <input id="sJib" type="range" min="20" max="53" step="1" value="30" /></div>
+      <div class="factor grid2">
+        <div><label>Wind</label>
+          <select id="selWind"><option value="low">LOW</option><option value="moderate" selected>MODERATE</option><option value="high">HIGH</option></select></div>
+        <div><label>Other crane / plant</label>
+          <select id="selCrane2"><option value="on" selected>2nd crane ON</option><option value="off">2nd crane OFF</option><option value="rotate">2nd crane ROTATING</option></select></div>
+      </div>
+      <div class="factor grid2">
+        <div><label>Building obstacles</label>
+          <select id="selObstacles"><option value="on" selected>ON (detect)</option><option value="off">OFF</option></select></div>
+        <div><label>Exclusion zones</label>
+          <select id="selExcl"><option value="on" selected>ON (enforce)</option><option value="off">OFF</option></select></div>
+      </div>
+      <div class="factor grid2">
+        <div><label>Site access gate</label>
+          <select id="selGate"><option value="open" selected>OPEN</option><option value="restricted">RESTRICTED</option></select></div>
+        <div><label>Crane config</label>
+          <select id="selConfig"><option value="standard" selected>Standard 30 m (validated)</option><option value="short">Short 20 m jib</option><option value="tall">Tall-mast (sim)</option></select></div>
+      </div>
+      <div class="toggles">
+        <label><input type="checkbox" id="tZones" checked /> Exclusion zones</label>
+        <label><input type="checkbox" id="tEnvelope" checked /> Crane envelope</label>
+        <label><input type="checkbox" id="tLabels" checked /> Labels</label>
+        <label><input type="checkbox" id="tWind" checked /> Wind arrows</label>
+      </div>
+      <div class="fine">Radius &amp; hook height auto-calculated from trolley / hoist. Limits shown are example / simulated values.</div>
+    </section>
+
+    <section class="card">
+      <h2>4 · Building Interaction</h2>
+      <div class="factor grid2">
+        <div><label>Building</label>
+          <select id="selBuilding"><option value="A">Building A</option><option value="B">Building B</option><option value="C">Building C</option></select></div>
+        <div><label>Floor</label><select id="selFloor"></select></div>
+      </div>
+      <div class="target-info" id="targetInfo">TARGET HEIGHT: Example 28 m · Material placement</div>
+      <div class="btn-row"><button id="btnGotoFloor">MOVE HOOK TO TARGET (MANUAL GUIDE)</button></div>
+    </section>
+
+    <section class="card twin">
+      <h2>5 · Digital Twin Concept (prototype)</h2>
+      <div class="flow">BIM / SITE MODEL ↓<br/>BUILDING + SITE GEOMETRY ↓<br/>TOWER CRANE SIMULATION ↓<br/>CRANE + ENVIRONMENT ↓<br/><b>DIGITAL TWIN CONCEPT</b></div>
+      <p>This prototype shows <i>conceptual</i> integration of crane simulation + building/site geometry + constraints + scenario testing. It is <b>not</b> a complete Digital Twin.</p>
+      <p class="story">Story: SITE → CRANE → HOIST → TROLLEY → SLEW → LOAD → BUILDING → CONSTRAINTS → SCENARIOS → TWIN</p>
+    </section>
+    </div><!-- /sim page -->
+
+    <div class="tabpage" data-page="crane">
+      <section class="card">
+        <h2>REAL CRANE — Potain MCT 88 (C25)</h2>
+        <table class="spec">
+          <tr><td>Manufacturer</td><td><b>Potain (Manitowoc Company, Inc.)</b></td></tr>
+          <tr><td>Model</td><td><b>MCT 88 (EN 14439 C25)</b></td></tr>
+          <tr><td>Crane type</td><td>Top-slewing flat-top tower crane</td></tr>
+          <tr><td>Jib configuration</td><td><b>30 m</b> installed (validation config; tip table covers 20–53.1 m)</td></tr>
+          <tr><td>Jib length (maximum)</td><td>52 m max radius (170.6 ft) — the crane model's upper limit, not the installed config</td></tr>
+          <tr><td>Maximum rated capacity</td><td><b>5 t</b> (flat inner region)</td></tr>
+          <tr><td>Tip load (30 m jib)</td><td><b>2.70 t</b> (published tip table)</td></tr>
+          <tr><td>Load moment M</td><td><b>2.70 × 30 = 81 t·m</b></td></tr>
+          <tr><td>Corner radius</td><td><b>81 / 5 = 16.2 m</b></td></tr>
+        </table>
+        <div class="fine">Tip-load table (m → t): 20→3.95 · 25→3.00 · 30→2.70 · 35→2.27 · 40→1.95 · 45→1.70 · 50→1.45 · 53.1→1.15. From STARTER-KIT §2 (real brochure figures).</div>
+        <div class="fine">Note: 30 m is the <b>installed</b> jib chosen for validation; <b>52 m</b> is the MCT 88's <b>maximum</b> jib. Move the jib slider (20–53 m) and the model re-derives M, corner and capacity via tipLoadAt().</div>
+      </section>
+      <section class="card">
+        <h2>REAL CRANE DATA SOURCE</h2>
+        <table class="spec">
+          <tr><td>Starter-kit source</td><td><a href="https://www.manitowoc.com/potain-ecatalog-en14439-c25d25.html" target="_blank" rel="noopener">Potain e-catalogue EN 14439 C25-D25 (official Manitowoc)</a> — bot-blocked for scripts; opened in a normal browser for verification</td></tr>
+          <tr><td>Load-chart document</td><td>Potain MCT 88 Data Sheet, FEM 1.001-A3 (Manitowoc, Code 09-003-.5M-0610) — “Load charts” page, 98 ft (≈30 m) jib row, upper (5.5 USt / 2-fall) line</td></tr>
+          <tr><td>Mirror PDF used</td><td>cranenetwork.com MCT 88 spec mirror of the Manitowoc sheet (imperial units; converted ft→m, USt→t and documented below)</td></tr>
+          <tr><td>Per-radius values</td><td>66 ft → 4.3 USt · 82 ft → 3.3 USt · 98 ft → 2.8 USt (upper row); converted in SOURCES.md</td></tr>
+          <tr><td>Capacity code</td><td>capacity.js — MCT88 / tipLoadAt / capacityAt / validate / hookInZone (from capacity.starter.js)</td></tr>
+          <tr><td>Date accessed</td><td>2026-09-11</td></tr>
+        </table>
+        <p class="fine">“Never cite an AI response as the source.” All chartT values above were read from the manufacturer sheet, not generated. See SOURCES.md for conversions.</p>
+      </section>
+    </div>
+
+    <div class="tabpage" data-page="chart">
+      <section class="card">
+        <h2>REAL LOAD CHART — 30 m jib</h2>
+        <div class="real-line">REAL CRANE: <b>Potain MCT 88</b> · JIB: <b>30 m</b> · MAX: <b>5 t</b> · TIP: <b>2.70 t</b> · M = <b>81 t·m</b> · CORNER = <b>16.2 m</b></div>
+        <canvas id="loadChart" width="380" height="260"></canvas>
+        <div class="chart-legend"><span><i class="line real"></i>Manufacturer chart points (solid)</span><span><i class="line model"></i>capacityAt model (dashed)</span></div>
+        <div class="fine">Model (STARTER-KIT §1): 5 t flat for r ≤ 16.2 m, then 81 / r. Must pass through the tip (30 m → 2.70 t). Dashed line is the teaching idealisation — NOT the manufacturer's equation.</div>
+        <div class="fine">Real per-radius points (MCT 88 sheet, 98 ft row, converted): 20.1 m → 3.90 t · 25.0 m → 2.99 t · 29.9 m → 2.54 t.</div>
+      </section>
+    </div>
+
+    <div class="tabpage" data-page="valid">
+      <section class="card">
+        <h2>REAL CRANE VALIDATION</h2>
+        <div class="real-line">Crane: <b>Potain MCT 88</b> · Jib: <b>30 m</b> · Harness: <b>validate(MCT88, 30, chart)</b> in capacity.js</div>
+        <table class="valid">
+          <thead><tr><th>Radius</th><th>Manufacturer</th><th>Model</th><th>Error</th></tr></thead>
+          <tbody id="validationBody"></tbody>
+        </table>
+        <div class="target-info" id="vSummary">MAX ERROR: — · TARGET ≤ 10%</div>
+        <div id="vStatus" class="risk mid">VALIDATION PENDING</div>
+        <div class="fine">errorPct = |model − chart| ÷ chart × 100. Same capacityAt() drives the sim. Open DevTools console to see validate() output.</div>
+      </section>
+      <section class="card">
+        <h2>Manual validation example (hand-derivation)</h2>
+        <div class="worked" id="workedExample">R = 20 m · M = 81 t·m · W = 81/20 = 4.05 t.</div>
+        <div class="fine">Team still hand-writes this on paper and photographs it. Same text ships in <b>validation-calculation.txt</b>. It does NOT replace the manufacturer chart.</div>
+      </section>
+    </div>
+
+    <div class="tabpage" data-page="constr">
+      <section class="card">
+        <h2>CONSTRAINTS — live geometric checks</h2>
+        <div class="target-info" id="exclStatus">EXCLUSION ZONES: —</div>
+        <div class="target-info" id="bldgStatus">BUILDING CLEARANCE: —</div>
+        <div class="fine">Exclusion test = hookInZone(hookX, hookZ, rect) every frame — obstacle avoidance, separate from load-moment safety. Hook world position comes from hookWorld().</div>
+        <div class="fine">Zones (rects): base x[−9,9] z[−9,9] (y&lt;12) · storage x[14,24] z[−8,2] · Crane-2 circle (−52,30) r=26 m (extra). Pickup pad + delivery visuals are NOT enforced.</div>
+        <div class="fine">Building check is a SIMPLIFIED GEOMETRIC CHECK — NOT A CERTIFIED CLEARANCE ANALYSIS.</div>
+      </section>
+    </div>
+
+    <div class="tabpage" data-page="twin">
+      <section class="card">
+        <h2>REAL MANUFACTURER DATA</h2>
+        <div class="fine">✓ Potain MCT 88 ✓ Maximum capacity (5 t) ✓ Published tip loads ✓ Manufacturer load chart (98 ft row) ✓ Selected chart validation points</div>
+        <h2>CALCULATED</h2>
+        <div class="fine">✓ Load moment (M = 81 t·m) ✓ Corner radius (16.2 m) ✓ Capacity at current radius ✓ Utilization ✓ Validation error ✓ Geometric zone test (hookInZone)</div>
+        <h2>SIMULATED</h2>
+        <div class="fine">✓ 3D crane ✓ Buildings ✓ Site layout ✓ Automatic lift ✓ Wind visualization</div>
+        <h2>NOT IMPLEMENTED</h2>
+        <div class="fine">✗ Real-time crane sensors ✗ Physical crane connection ✗ Full structural analysis ✗ Certified lift planning ✗ Complete manufacturer safety logic</div>
+      </section>
+      <section class="card twin">
+        <h2>Digital Twin Status</h2>
+        <div class="flow">REAL MCT 88 DATA + capacityAt MODEL + 3D SIM + SIM SITE ↓<br/><b>DATA-DRIVEN SIMULATION / PROTOTYPE</b></div>
+        <p><b>WHAT IS THIS NOW?</b> A data-driven tower-crane simulation/prototype using real manufacturer crane data and a simplified validated capacity model.</p>
+        <p><b>STILL MISSING FOR A FULL TWIN:</b> continuous physical-to-virtual synchronization · real operational/sensor data · validated dynamic behaviour · broader real site state · operational feedback/decision loop.</p>
+        <p class="story">BIM = building/site information · Simulation = behaviour model · Twin = live-synced virtual + physical.</p>
+      </section>
+      <section class="card">
+        <h2>Physics (STARTER-KIT §1)</h2>
+        <p class="fine">M = tipLoad × jibLength = 2.70 × 30 = 81 t·m. cornerRadius = M / maxCapacity = 81 / 5 = 16.2 m. r ≤ corner → 5 t; r &gt; corner → 81 / r; r &gt; jib → null (out of range); r ≤ 0 → 5 t. Never exceeds maxCapacity.</p>
+      </section>
+    </div>
+  </aside>
+</main>
+
+<footer class="statusbar">
+  <span>CRANE: <b id="stCrane">ACTIVE</b></span>
+  <span>OP: <b id="stOp">MANUAL</b></span>
+  <span>LOAD: <b id="stLoad">2.0 t</b></span>
+  <span>RADIUS: <b id="stRadius">20.0 m</b></span>
+  <span>HOOK: <b id="stHook">24.0 m</b></span>
+  <span>SLEW: <b id="stSlew">0°</b></span>
+  <span>WIND: <b id="stWind">MODERATE</b></span>
+  <span>SITE: <b>SIMULATED</b></span>
+</footer>
+
+<div id="glError" class="gl-error hidden"></div>
+
+<script src="capacity.js"></script>
+<script src="script.js"></script>
+</body>
+</html>

@@ -1,0 +1,21 @@
+# OS / editor noise — never commit these
+desktop.ini
+Thumbs.db
+.DS_Store
+*.lnk
+*.tmp
+*.bak
+*~
+
+# Secrets / credentials — never commit these
+.env
+.env.*
+*.pem
+*.key
+secrets.json
+credentials.json
+
+# Dependencies / build output (none in this static project, kept for safety)
+node_modules/
+dist/
+build/
