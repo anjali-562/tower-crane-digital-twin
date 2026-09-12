@@ -73,7 +73,7 @@ const S = {
   autoStep: -1, autoTimer: 0, attached: false, autoHold: null,
   target: { building: 'A', floor: 8 },
   conflicts: [], risk: 'low', time: 0,
-  exclHit: null, bldgHit: null,
+  exclHit: null, bldgHit: null, bldgNear: null,
   cap: null, util: null, moment: null, corner: null,
 };
 
@@ -502,7 +502,25 @@ function highlightZones(hit) {
   }
 }
 
-// ---------- updateCollisionDetection: capacityAt + hookInZone + building boxes ----------
+// Early-warning envelope (simulated): warn BEFORE the load enters the
+// building volume so the operator can stop/adjust in time. Distances are
+// example values, not certified clearances.
+const BLDG_WARN_XY = 4.0;  // horizontal buffer (m) around footprint
+const BLDG_WARN_TOP = 5.0; // vertical buffer (m) above roof
+const BLDG_INSIDE_E = 0.8; // contact tolerance for the hard conflict test
+function buildingClearance(lp, b) {
+  const dx = Math.max(b.box.min.x - lp.x, 0, lp.x - b.box.max.x);
+  const dz = Math.max(b.box.min.z - lp.z, 0, lp.z - b.box.max.z);
+  const horiz = Math.hypot(dx, dz);
+  const above = lp.y - b.box.max.y; // >0 means above roof
+  const insideXZ = lp.x > b.box.min.x - BLDG_INSIDE_E && lp.x < b.box.max.x + BLDG_INSIDE_E &&
+                   lp.z > b.box.min.z - BLDG_INSIDE_E && lp.z < b.box.max.z + BLDG_INSIDE_E;
+  const inside = insideXZ && lp.y < b.box.max.y;
+  const near = !inside && horiz < BLDG_WARN_XY && lp.y < b.box.max.y + BLDG_WARN_TOP;
+  return { horiz, above, inside, near };
+}
+
+ // ---------- updateCollisionDetection: capacityAt + hookInZone + building boxes ----------
 const banner = document.getElementById('warningBanner');
 function updateCollisionDetection() {
   const p = hookWorld();
@@ -517,20 +535,31 @@ function updateCollisionDetection() {
 
   // --- Building check: hook/load world position vs simplified building boxes ---
   // SIMPLIFIED GEOMETRIC CHECK — NOT A CERTIFIED CLEARANCE ANALYSIS.
-  let bldgHit = null;
+  // Two levels: (1) HARD CONFLICT when inside the volume (bad),
+  // (2) EARLY WARNING when inside the 4 m / 5 m buffer (warn) — fires BEFORE contact.
+  let bldgHit = null, bldgNear = null;
   if (S.obstaclesOn) {
     for (const [key, b] of Object.entries(buildings)) {
-      const e = 0.8;
-      if (lp.x > b.box.min.x - e && lp.x < b.box.max.x + e &&
-          lp.z > b.box.min.z - e && lp.z < b.box.max.z + e &&
-          lp.y < b.box.max.y + e) {
-        const approxFloor = Math.max(1, Math.min(b.floors, Math.round(lp.y / b.floorH)));
-        if (lp.y < b.box.max.y) { bldgHit = { key, floor: approxFloor }; conf.push({ type: 'bad', msg: `SIMULATED BUILDING CLEARANCE CONFLICT — load inside Building ${key} (~floor ${approxFloor})` }); }
-        else conf.push({ type: 'warn', msg: `SIMULATED CLEARANCE WARNING — load close above Building ${key}` });
+      const c = buildingClearance(lp, b);
+      const approxFloor = Math.max(1, Math.min(b.floors, Math.round(lp.y / b.floorH)));
+      if (c.inside) {
+        bldgHit = { key, floor: approxFloor };
+        conf.push({ type: 'bad', msg: `SIMULATED BUILDING CLEARANCE CONFLICT — load inside Building ${key} (~floor ${approxFloor})` });
+      } else if (c.near) {
+        // Keep the closest approach only, so the banner names one building.
+        if (!bldgNear || c.horiz < bldgNear.horiz) bldgNear = { key, floor: approxFloor, horiz: c.horiz, above: c.above };
+      } else if (c.above >= 0 && c.above < BLDG_WARN_TOP && c.horiz < BLDG_WARN_XY + 2) {
+        if (!bldgNear || c.horiz < bldgNear.horiz) bldgNear = { key, floor: approxFloor, horiz: c.horiz, above: c.above };
       }
     }
+    if (!bldgHit && bldgNear) {
+      const where = bldgNear.above >= 0
+        ? `${bldgNear.above.toFixed(1)} m above roof`
+        : `~floor ${bldgNear.floor}`;
+      conf.push({ type: 'warn', msg: `SIMULATED APPROACH WARNING — load ${bldgNear.horiz.toFixed(1)} m from Building ${bldgNear.key} (${where}) — slow / adjust path before conflict` });
+    }
   }
-  S.bldgHit = bldgHit;
+  S.bldgHit = bldgHit; S.bldgNear = bldgNear;
 
   // --- Jib reach: radius beyond installed jib (capacityAt returns null there) ---
   if (cap == null) conf.push({ type: 'bad', msg: `DANGER — radius ${r.toFixed(1)} m beyond ${S.jibLen} m jib (out of chart)` });
@@ -558,7 +587,10 @@ function updateCollisionDetection() {
     banner.textContent = '⚠ ' + conf[0].msg + (conf.length > 1 ? `  (+${conf.length - 1} more)` : '');
   }
   // Replaces the old placeholder risk heuristic completely.
+  // Building proximity upgrades risk BEFORE contact: near = warning, inside = danger.
   S.risk = (cap == null || util >= 1.0) ? 'high' : (util >= 0.9 ? 'mid' : 'low');
+  if (S.bldgHit) S.risk = 'high';
+  else if (S.bldgNear && S.risk === 'low') S.risk = 'mid';
 }
 
 // ---------- updateWind: indicator only (visual in updateCraneMovement) ----------
@@ -602,9 +634,9 @@ function updateUI() {
   const ex = $('exclStatus'), bl = $('bldgStatus');
   if (ex) ex.textContent = S.exclHit ? `EXCLUSION ZONE VIOLATION — ${S.exclHit.label}` : 'PATH CLEAR';
   if (bl) {
-    bl.textContent = S.bldgHit
-      ? `SIMULATED BUILDING CLEARANCE CONFLICT — Building ${S.bldgHit.key} (~floor ${S.bldgHit.floor}). SIMPLIFIED GEOMETRIC CHECK — NOT A CERTIFIED CLEARANCE ANALYSIS.`
-      : 'BUILDING CLEARANCE: CLEAR. SIMPLIFIED GEOMETRIC CHECK — NOT A CERTIFIED CLEARANCE ANALYSIS.';
+    if (S.bldgHit) bl.textContent = `SIMULATED BUILDING CLEARANCE CONFLICT — Building ${S.bldgHit.key} (~floor ${S.bldgHit.floor}). SIMPLIFIED GEOMETRIC CHECK — NOT A CERTIFIED CLEARANCE ANALYSIS.`;
+    else if (S.bldgNear) bl.textContent = `SIMULATED APPROACH WARNING — ${S.bldgNear.horiz.toFixed(1)} m from Building ${S.bldgNear.key} (~floor ${S.bldgNear.floor}). Early-warning buffer ${BLDG_WARN_XY.toFixed(0)} m / +${BLDG_WARN_TOP.toFixed(0)} m — adjust path before conflict. SIMPLIFIED GEOMETRIC CHECK — NOT A CERTIFIED CLEARANCE ANALYSIS.`;
+    else bl.textContent = 'BUILDING CLEARANCE: CLEAR. SIMPLIFIED GEOMETRIC CHECK — NOT A CERTIFIED CLEARANCE ANALYSIS.';
   }
   $('stCrane').textContent = S.playing ? 'ACTIVE' : 'PAUSED';
   $('stOp').textContent = S.mode === 'auto' ? ('AUTO STEP ' + (S.autoStep + 1) + '/10') : 'MANUAL';
@@ -644,6 +676,20 @@ function autoChecks(stageLabel) {
     $('opDetail').textContent = S.autoHold;
     return false;
   }
+  // Prevent building contact: hard conflict always holds; early-warning holds
+  // during travel (HOIST/TROLLEY/SLEW/CHECKS) but is allowed for the final
+  // intentional LOWER/PLACE approach to the target building.
+  if (S.bldgHit) {
+    S.autoHold = `BUILDING CONFLICT (${stageLabel}) — load inside Building ${S.bldgHit.key} (~floor ${S.bldgHit.floor}). Adjust slew/radius/height to resume.`;
+    $('opDetail').textContent = S.autoHold;
+    return false;
+  }
+  const isFinalApproach = stageLabel === 'LOWER' || stageLabel === 'PLACE';
+  if (S.bldgNear && !isFinalApproach) {
+    S.autoHold = `BUILDING APPROACH HOLD (${stageLabel}) — ${S.bldgNear.horiz.toFixed(1)} m from Building ${S.bldgNear.key}. Path paused BEFORE conflict — adjust slew/radius/height to resume.`;
+    $('opDetail').textContent = S.autoHold;
+    return false;
+  }
   S.autoHold = null;
   return true;
 }
@@ -669,7 +715,8 @@ function runAutomaticLift(dt) {
   S.autoTimer += dt * spd;
   const liveTxt = () => {
     const c = capNow(S.trolley), u = c == null ? 999 : S.load / c;
-    return `LOAD ${S.load.toFixed(2)}t · R ${S.trolley.toFixed(1)}m · CAP ${c == null ? '—' : c.toFixed(2) + 't'} · UTIL ${u > 9 ? '—' : (u * 100).toFixed(0) + '%'} · ${S.exclHit ? 'EXCLUSION ZONE VIOLATION' : 'PATH CLEAR'} · ${S.bldgHit ? 'BLDG CONFLICT ' + S.bldgHit.key : 'BLDG CLEAR'}`;
+    const bldg = S.bldgHit ? 'BLDG CONFLICT ' + S.bldgHit.key : (S.bldgNear ? `BLDG ${S.bldgNear.horiz.toFixed(1)}m→${S.bldgNear.key}` : 'BLDG CLEAR');
+    return `LOAD ${S.load.toFixed(2)}t · R ${S.trolley.toFixed(1)}m · CAP ${c == null ? '—' : c.toFixed(2) + 't'} · UTIL ${u > 9 ? '—' : (u * 100).toFixed(0) + '%'} · ${S.exclHit ? 'EXCLUSION ZONE VIOLATION' : 'PATH CLEAR'} · ${bldg}`;
   };
   switch (S.autoStep) {
     case 0: mv(travelH, pick.r, pick.slew); $('opDetail').textContent = '1. PICKUP — load at green pad. ' + liveTxt(); if (done && S.autoTimer > 2) next(); break;
@@ -690,7 +737,7 @@ function runAutomaticLift(dt) {
 function resetSimulation() {
   S.tHoist = 24; S.tTrolley = 20; S.tSlew = 0; S.load = 2; S.jibLen = 30; // 30 m validation jib
   S.autoStep = -1; S.mode = 'manual'; S.autoHold = null;
-  S.attached = false; S.conflicts = []; S.exclHit = null; S.bldgHit = null;
+  S.attached = false; S.conflicts = []; S.exclHit = null; S.bldgHit = null; S.bldgNear = null;
   S.cap = null; S.util = null;
   $('sHoist').value = 24; $('sTrolley').value = 20; $('sSlew').value = 0; $('sLoad').value = 2;
   $('sJib').value = 30; $('sTrolley').max = 29;
