@@ -651,6 +651,10 @@ function updateUI() {
   } else {
     $('liftBar').style.width = '0';
   }
+  // LIVE LOAD-CAPACITY CHART: must follow every lift/movement (trolley, load, jib, risk, planner, auto)
+  const ck = S.jibLen + '|' + S.trolley.toFixed(2) + '|' + S.load.toFixed(2) + '|' + S.risk + '|' + (plannerLast ? plannerLast.radius.toFixed(1) + '/' + plannerLast.load.toFixed(1) : '-');
+  if (ck !== lastChartKey) { lastChartKey = ck; drawChart(); }
+  const slewHint = $('plSlewHint'); if (slewHint) slewHint.textContent = Math.round(S.slew) + '°';
 }
 
 // ---------- runAutomaticLift (uses REAL chart + geometric checks each stage) ----------
@@ -743,10 +747,17 @@ function resetSimulation() {
   $('sJib').value = 30; $('sTrolley').max = 29;
   [...slewGroup.children].filter(o => o.userData.pendant).forEach(o => slewGroup.remove(o));
   rebuildJib();
+  lastChartKey = ''; plannerLast = null; plannerTarget = null;
   drawChart();
   $('opStep').textContent = 'MANUAL — AWAITING INPUT';
   $('opDetail').textContent = 'Hoist / Trolley / Slew sliders are live';
   syncModeButtons();
+  // Reset planner display
+  const set = (id,t)=>{const e=$(id); if(e) e.textContent=t;};
+  set('plResult','No lift checked yet — enter load / radius / height and press CHECK LIFT.');
+  set('plResLoad','—'); set('plResRadius','—'); set('plResHeight','—'); set('plResCap','—'); set('plResUtil','—'); set('plResMoment','—'); set('plResCorner','—'); set('plResMLimit','—'); set('plZoneRow','—'); set('plBldgRow','—');
+  const v=$('plVerdict'); if(v){v.className='risk low'; v.textContent='AWAITING CHECK';}
+  set('plReason','—'); set('plSafeRadius','—');
 }
 
 // ---------- animateCrane ----------
@@ -852,6 +863,9 @@ function wireUI() {
     $('opStep').textContent = `MANUAL GUIDE → BLDG ${S.target.building} F${S.target.floor}`;
     $('opDetail').textContent = `Target example height ${t.height.toFixed(1)} m. Sliders pre-set — press PLAY if paused.`;
   });
+  // Lift Planner — simulation-based engineering check (uses existing capacityAt/hookInZone/buildingClearance)
+  const bc = $('btnCheckLift'); if (bc) bc.addEventListener('click', checkLift);
+  const bu = $('btnUseAsDemo'); if (bu) bu.addEventListener('click', useAsDemo);
 }
 
 // ---------- Validation table + load-chart canvas (capacityAt vs real points) ----------
@@ -884,6 +898,7 @@ function buildValidation() {
   }
   return worst;
 }
+let plannerLast = null, plannerTarget = null, lastChartKey = '';
 function drawChart() {
   const cv = $('loadChart');
   if (!cv) return;
@@ -899,7 +914,7 @@ function drawChart() {
   for (let r = 0; r <= xs[1]; r += 5) { ctx.beginPath(); ctx.moveTo(X(r), pad.t); ctx.lineTo(X(r), H - pad.b); ctx.stroke(); ctx.fillText(r + 'm', X(r) - 8, H - 12); }
   for (let c = 0; c <= 6; c += 1) { ctx.beginPath(); ctx.moveTo(pad.l, Y(c)); ctx.lineTo(W - pad.r, Y(c)); ctx.stroke(); ctx.fillText(c + 't', 12, Y(c) + 3); }
   ctx.fillText('Working Radius (m) →', W / 2 - 50, H - 1);
-  // capacityAt model (dashed amber): flat to corner, then M/r, null beyond jib
+  // capacityAt model (dashed amber): flat to corner, then M/r, null beyond jib — generated from capacityAt(), not hard-coded
   ctx.strokeStyle = '#f5a623'; ctx.lineWidth = 2; ctx.setLineDash([6, 4]); ctx.beginPath();
   let started = false;
   for (let r = 0.5; r <= jib; r += 0.25) {
@@ -915,14 +930,149 @@ function drawChart() {
   ctx.fillStyle = '#2ecc71';
   const pts = (Math.abs(jib - 30) < 0.01) ? CHART30 : [];
   pts.forEach(p => { ctx.beginPath(); ctx.arc(X(p.radiusM), Y(p.chartT), 3.5, 0, 7); ctx.fill(); });
-  // Current operating point (white ring)
+  // Current operating point — allowed capacity (white ring)
   const cc = capNow(S.trolley);
   if (cc != null) {
-    ctx.strokeStyle = '#fff'; ctx.beginPath(); ctx.arc(X(S.trolley), Y(Math.min(cc, ys[1])), 5, 0, 7); ctx.stroke();
+    ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.arc(X(S.trolley), Y(Math.min(cc, ys[1])), 5, 0, 7); ctx.stroke(); ctx.lineWidth = 1;
+  }
+  // Current load marker — filled dot coloured by live risk (SAFE green / WARNING amber / DANGER red) — LIVE
+  const riskCol = S.risk === 'high' ? '#e74c3c' : (S.risk === 'mid' ? '#f5a623' : '#2ecc71');
+  const ly = Y(Math.max(0, Math.min(S.load, ys[1])));
+  const lx = X(Math.max(0, Math.min(S.trolley, xs[1])));
+  ctx.fillStyle = riskCol;
+  ctx.beginPath(); ctx.arc(lx, ly, 4.5, 0, 7); ctx.fill();
+  ctx.strokeStyle = '#fff'; ctx.lineWidth = 0.8; ctx.stroke();
+  ctx.lineWidth = 1;
+  ctx.fillStyle = '#fff'; ctx.font = '9px Arial';
+  ctx.fillText(S.load.toFixed(1) + 't', lx + 7, ly - 7);
+  // Planned lift target marker (if checked) — cross
+  if (plannerLast != null && isFinite(plannerLast.radius) && isFinite(plannerLast.load)) {
+    const px = X(Math.max(0, Math.min(plannerLast.radius, xs[1])));
+    const py = Y(Math.max(0, Math.min(plannerLast.load, ys[1])));
+    ctx.strokeStyle = '#2f6f8f'; ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(px - 6, py - 6); ctx.lineTo(px + 6, py + 6);
+    ctx.moveTo(px + 6, py - 6); ctx.lineTo(px - 6, py + 6);
+    ctx.stroke(); ctx.lineWidth = 1;
+    ctx.fillStyle = '#2f6f8f'; ctx.font = '9px Arial';
+    ctx.fillText('plan ' + plannerLast.load.toFixed(1) + 't', px + 8, py - 8);
   }
   // Tip marker: model must pass through published tip
   const tip = tipLoadAt(MCT88, jib);
-  ctx.fillStyle = '#93a5b8'; ctx.fillText(`M=${MM.toFixed(1)} tip=${tip.toFixed(2)}t`, pad.l + 4, pad.t + 10);
+  ctx.fillStyle = '#93a5b8'; ctx.font = '10px Arial'; ctx.fillText(`M=${MM.toFixed(1)} tip=${tip.toFixed(2)}t`, pad.l + 4, pad.t + 10);
+  // Update live text below canvas — CURRENT Radius/Load/Allowed/Utilization (uses same capacityAt)
+  const curCap = cc;
+  const curUtil = curCap == null ? null : S.load / curCap;
+  const elR = $('chartCurRadius'), elL = $('chartCurLoad'), elA = $('chartCurAllowed'), elU = $('chartCurUtil'), elRisk = $('chartCurRisk'), elJ = $('rJibChart');
+  if (elR) elR.textContent = S.trolley.toFixed(1) + ' m';
+  if (elL) elL.textContent = S.load.toFixed(2) + ' t';
+  if (elA) elA.textContent = curCap == null ? 'OUT OF RANGE' : curCap.toFixed(2) + ' t';
+  if (elU) elU.textContent = curUtil == null || curUtil > 9 ? '—' : (curUtil * 100).toFixed(1) + '%';
+  if (elRisk) { elRisk.textContent = S.risk === 'high' ? 'DANGER' : (S.risk === 'mid' ? 'WARNING' : 'SAFE'); elRisk.className = S.risk === 'high' ? 'tone-bad' : (S.risk === 'mid' ? 'tone-warn' : 'tone-ok'); }
+  if (elJ) elJ.textContent = jib + ' m';
+}
+
+// ---------- Lift Planner (simulation-based engineering check) ----------
+// Uses the EXISTING engineering model as single source of truth: capacityAt(MCT88, jib, radius), hookInZone, buildingClearance.
+// No crane specs invented, thresholds consistent with live simulation ( <0.90 SAFE, 0.90-<1.00 WARNING, ≥1.00 DANGER).
+function safeRadiusFor(loadT) {
+  let best = null;
+  const kmax = Math.round(S.jibLen * 10);
+  for (let k = 40; k <= kmax; k++) {
+    const r = k / 10;
+    const c = capacityAt(MCT88, S.jibLen, r);
+    if (c != null && loadT <= c) best = r;
+  }
+  return best;
+}
+function checkLift() {
+  const set = (id, t) => { const e = $(id); if (e) e.textContent = t; };
+  const L = parseFloat($('plLoad').value), R = parseFloat($('plRadius').value), H = parseFloat($('plHeight').value);
+  const slewHint = $('plSlewHint'); if (slewHint) slewHint.textContent = Math.round(S.slew) + '°';
+  if (!isFinite(L) || !isFinite(R) || !isFinite(H) || L < 0 || R <= 0 || H <= 0) {
+    set('plResult', 'Enter valid numbers: load ≥ 0 t, radius > 0 m, height > 0 m.');
+    const v0 = $('plVerdict'); if (v0) { v0.className = 'risk mid'; v0.textContent = 'INVALID INPUT'; }
+    set('plReason', '—'); set('plSafeRadius', '—');
+    set('plResLoad','—'); set('plResRadius','—'); set('plResHeight','—'); set('plResCap','—'); set('plResUtil','—'); set('plResMoment','—'); set('plResCorner','—'); set('plResMLimit','—'); set('plZoneRow','—'); set('plBldgRow','—');
+    return;
+  }
+  const cap = capacityAt(MCT88, S.jibLen, R);
+  const util = (cap == null || cap <= 0) ? null : L / cap;
+  const corner = cornerNow(), Mlim = momentNow();
+  const loadMoment = L * R;
+  // Target ground position along current slew direction (same mapping as hookWorld)
+  const a = THREE.MathUtils.degToRad(S.slew);
+  const tx = Math.cos(a) * R, tz = -Math.sin(a) * R;
+  const lp = { x: tx, y: H, z: tz };
+  const zh = S.exclOn ? zoneHit(lp) : null;
+  let bHit = null, bNear = null, bNearDist = null;
+  if (S.obstaclesOn) {
+    for (const key in buildings) {
+      if (!Object.prototype.hasOwnProperty.call(buildings, key)) continue;
+      const c = buildingClearance(lp, buildings[key]);
+      if (c.inside) { bHit = key; break; }
+      if (c.near && !bNear) { bNear = key; bNearDist = c.horiz; }
+    }
+  }
+  const capPass = cap != null && util != null && util < 1.0;
+  const capNear = cap != null && util != null && util >= 0.9 && util < 1.0;
+  const zonePass = !zh;
+  const bldgPass = !bHit;
+  const nearLimit = capNear || !!bNear;
+  const ok = capPass && zonePass && bldgPass && !nearLimit;
+  // Overall result states consistent with existing risk thresholds
+  let verdictText, verdictClass;
+  if (!capPass || !zonePass || !bldgPass) { verdictText = '✕ LIFT NOT FEASIBLE'; verdictClass = 'risk high'; }
+  else if (nearLimit) { verdictText = '⚠ LIFT NEAR LIMIT'; verdictClass = 'risk mid'; }
+  else { verdictText = '✓ LIFT FEASIBLE'; verdictClass = 'risk low'; }
+  const reasons = [];
+  if (!capPass) reasons.push(cap == null ? ('Radius ' + R.toFixed(1) + ' m is beyond the ' + S.jibLen + ' m jib (out of chart).') : ('Requested load exceeds capacity at target radius (' + L.toFixed(2) + ' t > ' + cap.toFixed(2) + ' t, util ' + (util*100).toFixed(1) + '%).'));
+  else if (capNear) reasons.push('High utilization (' + (util*100).toFixed(1) + '%) — near limit (≥90%).');
+  if (!zonePass) reasons.push('Target lies inside ' + zh.label + '.');
+  if (!bldgPass) reasons.push('Target lies inside Building ' + bHit + ' (simplified geometric check).');
+  if (bNear && bldgPass) reasons.push('Note: target inside early-warning buffer near Building ' + bNear + ' (' + bNearDist.toFixed(1) + ' m) — near limit.');
+  if (loadMoment > Mlim) reasons.push('Load moment ' + loadMoment.toFixed(1) + ' t·m exceeds limit ' + Mlim.toFixed(1) + ' t·m.');
+  plannerLast = { load: L, radius: R, height: H, ok: ok && !nearLimit, nearLimit, cap, util, moment: loadMoment, corner, zone: zh ? zh.label : null, bHit, bNear };
+  plannerTarget = { x: tx, y: H, z: tz };
+  set('plResLoad', L.toFixed(2) + ' t');
+  set('plResRadius', R.toFixed(1) + ' m');
+  set('plResHeight', H.toFixed(1) + ' m');
+  set('plResCap', cap == null ? 'OUT OF RANGE' : cap.toFixed(2) + ' t');
+  set('plResUtil', (util == null || util > 9) ? '—' : (util * 100).toFixed(1) + ' %');
+  set('plResMoment', loadMoment.toFixed(1) + ' t·m');
+  set('plResCorner', corner.toFixed(1) + ' m');
+  set('plResMLimit', Mlim.toFixed(1) + ' t·m');
+  set('plZoneRow', zh ? '✕ ' + zh.label : '✓ CLEAR');
+  set('plBldgRow', bHit ? '✕ CONFLICT — Building ' + bHit : (bNear ? '⚠ NEAR — Building ' + bNear + ' (' + bNearDist.toFixed(1) + ' m buffer)' : '✓ CLEAR'));
+  const v = $('plVerdict');
+  if (v) { v.className = verdictClass; v.textContent = verdictText; }
+  set('plReason', reasons.length ? reasons.join(' ') : 'All checks pass at the target point with current slew (' + Math.round(S.slew) + '°) and environment toggles.');
+  set('plResult', 'Checked load ' + L.toFixed(2) + ' t @ R ' + R.toFixed(1) + ' m, H ' + H.toFixed(1) + ' m · jib ' + S.jibLen + ' m · slew ' + Math.round(S.slew) + '°. Same capacityAt() model as live badge — simulation-based engineering check, NOT a certified lift plan.');
+  const sr = safeRadiusFor(L);
+  set('plSafeRadius', sr != null ? ('Recommendation: ' + L.toFixed(2) + ' t stays within capacity up to radius ≤ ' + sr.toFixed(1) + ' m (current jib ' + S.jibLen + ' m).' + (capPass ? '' : ' Reduce load OR move trolley closer.')) : 'No safe radius found within the crane envelope.');
+  lastChartKey = ''; drawChart();
+}
+function useAsDemo() {
+  if (!plannerLast) { alert('Check a lift first (CHECK LIFT).'); return; }
+  if (plannerLast.cap == null) { alert('Target radius beyond jib — cannot use as demo.'); return; }
+  const util = plannerLast.util;
+  if (util != null && util >= 1.0) { if (!confirm('Lift is NOT FEASIBLE (util ' + (util*100).toFixed(1) + '%). Load still?')) return; }
+  S.load = Math.max(0, Math.min(plannerLast.load, 5));
+  S.tTrolley = Math.max(4, Math.min(plannerLast.radius, S.jibLen - 1));
+  S.tHoist = Math.max(2, Math.min(plannerLast.height, 46));
+  // Keep slew as is (planner uses current slew)
+  $('sLoad').value = S.load; $('sTrolley').value = S.tTrolley; $('sHoist').value = S.tHoist;
+  // Update displays immediately
+  $('vLoad').textContent = S.load.toFixed(1) + ' t'; $('vTrolley').textContent = S.tTrolley.toFixed(1) + ' m'; $('vHoist').textContent = S.tHoist.toFixed(1) + ' m';
+  // Switch to manual mode so auto can run
+  S.mode = 'manual'; S.autoStep = -1; syncModeButtons();
+  drawChart();
+  // Optionally jump camera to hook
+  // setCam('hook'); // keep current view
+  const info = $('opDetail');
+  if (info) info.textContent = 'Demo lift loaded from planner: load ' + S.load.toFixed(1) + 't @ ' + S.tTrolley.toFixed(1) + 'm, hoist ' + S.tHoist.toFixed(1) + 'm — press START DEMONSTRATION LIFT.';
+  const step = $('opStep');
+  if (step) step.textContent = 'PLANNER → MANUAL — READY FOR DEMO';
 }
 
 // ---------- Boot ----------

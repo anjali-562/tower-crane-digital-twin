@@ -28,6 +28,7 @@
       <button data-side="sim" class="active">Overview</button>
       <button data-side="crane">Crane Data</button>
       <button data-side="chart">Load Chart</button>
+      <button data-side="planner">Lift Planner</button>
       <button data-side="constr">Constraints</button>
       <button data-side="valid">Validation</button>
       <button data-side="twin">Digital Twin</button>
@@ -166,6 +167,7 @@
             <button data-tab="sim" class="active">SIMULATION</button>
             <button data-tab="crane">REAL CRANE</button>
             <button data-tab="chart">LOAD CHART</button>
+            <button data-tab="planner">LIFT PLANNER</button>
             <button data-tab="valid">VALIDATION</button>
             <button data-tab="constr">CONSTRAINTS</button>
             <button data-tab="twin">DIGITAL TWIN</button>
@@ -269,12 +271,55 @@
 
           <div class="tabpage" data-page="chart">
             <section class="card">
-              <h2>Published load chart — 30 m jib</h2>
-              <div class="real-line">PUBLISHED CRANE DATA: <b>Potain MCT 88</b> · JIB: <b>30 m</b> · MAX: <b>5 t</b> · TIP: <b>2.70 t</b> · M = <b>81 t·m</b> · CORNER = <b>16.2 m</b></div>
+              <h2>Load Capacity vs Working Radius — LIVE</h2>
+              <div class="real-line">PUBLISHED CRANE DATA: <b>Potain MCT 88</b> · JIB: <b id="rJibChart">30 m</b> · MAX: <b>5 t</b> · TIP: <b>2.70 t</b> · M = <b>81 t·m</b> · CORNER = <b>16.2 m</b></div>
+              <div class="real-line" style="margin-top:4px; font-weight:700; color:var(--accent)">LIVE LOAD-CAPACITY CHART — generated from capacityAt()</div>
               <canvas id="loadChart" width="380" height="260"></canvas>
-              <div class="chart-legend"><span><i class="line real"></i>Manufacturer chart points (solid)</span><span><i class="line model"></i>capacityAt model (dashed)</span></div>
+              <div class="chart-legend"><span><i class="line real"></i>Manufacturer chart points (solid)</span><span><i class="line model"></i>capacityAt model (dashed)</span><span><i class="dot now"></i>Allowed capacity</span><span><i class="dot load"></i>Current load</span></div>
+              <div id="chartLive" class="target-info" style="margin-top:8px; font-size:11.5px">
+                <b>CURRENT</b> — Radius: <b id="chartCurRadius">—</b> · Load: <b id="chartCurLoad">—</b> · Allowed: <b id="chartCurAllowed">—</b> · Utilization: <b id="chartCurUtil">—</b> · <span id="chartCurRisk">—</span>
+              </div>
               <div class="fine">Model (STARTER-KIT §1): 5 t flat for r ≤ 16.2 m, then 81 / r. Must pass through the tip (30 m → 2.70 t). Dashed line is the teaching idealisation — NOT the manufacturer's equation.</div>
               <div class="fine">Real per-radius points (MCT 88 sheet, 98 ft row, converted): 20.1 m → 3.90 t · 25.0 m → 2.99 t · 29.9 m → 2.54 t.</div>
+              <div class="fine" style="margin-top:8px; border-top:1px solid var(--line-soft); padding-top:8px"><b>Why does capacity decrease?</b> Near the mast, the crane is limited by its maximum rated capacity (5 t). Beyond the corner radius (16.2 m), allowable load follows the load-moment relationship: <b>M = Load × Radius (81 t·m)</b>. Therefore, as radius increases, allowable load decreases (e.g., 20 m → 4.05 t, 25 m → 3.24 t, 30 m → 2.70 t).</div>
+            </section>
+          </div>
+
+          <div class="tabpage" data-page="planner">
+            <section class="card">
+              <h2>Lift Planner — Simulation-based engineering check</h2>
+              <div class="fine">Planning tool using the same <b>capacityAt(MCT88, jibLength, targetRadius)</b> + <b>hookInZone()</b> + <b>buildingClearance()</b> as the live simulation. <b>NOT A CERTIFIED LIFT PLAN.</b> All calculations are simulation-based engineering checks.</div>
+              <div class="factor grid3" style="margin-top:10px">
+                <div><label for="plLoad">Planned load (t)</label><input id="plLoad" type="number" min="0" max="5" step="0.1" value="3.0" /></div>
+                <div><label for="plRadius">Target radius (m)</label><input id="plRadius" type="number" min="4" max="30" step="0.5" value="20" /></div>
+                <div><label for="plHeight">Target hook height (m)</label><input id="plHeight" type="number" min="2" max="46" step="0.5" value="24" /></div>
+              </div>
+              <div class="fine">Target position is evaluated along the current slew direction ( <b id="plSlewHint">0°</b> ). Radius 4–29 m (trolley limits), hook 2–46 m.</div>
+              <div class="btn-row" style="margin-top:10px"><button id="btnCheckLift">CHECK LIFT</button> <button id="btnUseAsDemo" class="secondary">USE AS DEMO LIFT</button></div>
+            </section>
+            <section class="card">
+              <h2>Planned lift result</h2>
+              <div id="plResult" class="fine">No lift checked yet — enter load / radius / height and press CHECK LIFT.</div>
+              <table class="spec" style="margin-top:8px">
+                <tr><td>Requested load</td><td><b id="plResLoad">—</b></td></tr>
+                <tr><td>Target radius</td><td><b id="plResRadius">—</b></td></tr>
+                <tr><td>Target hook height</td><td><b id="plResHeight">—</b></td></tr>
+                <tr><td>Allowed capacity at radius</td><td><b id="plResCap">—</b></td></tr>
+                <tr><td>Utilization</td><td><b id="plResUtil">—</b></td></tr>
+                <tr><td>Load moment</td><td><b id="plResMoment">—</b></td></tr>
+                <tr><td>Corner radius</td><td><b id="plResCorner">—</b></td></tr>
+                <tr><td>Load moment limit (M)</td><td><b id="plResMLimit">—</b></td></tr>
+                <tr><td>Exclusion-zone status</td><td><b id="plZoneRow">—</b></td></tr>
+                <tr><td>Building-clearance status</td><td><b id="plBldgRow">—</b></td></tr>
+              </table>
+              <div id="plVerdict" class="risk low" style="font-size:13px; padding:10px 8px; margin-top:8px;">AWAITING CHECK</div>
+              <div class="target-info" id="plReason" style="margin-top:6px">—</div>
+              <h3 class="subhead">Recommendation</h3>
+              <div class="target-info" id="plSafeRadius">—</div>
+            </section>
+            <section class="card">
+              <h2>How this was calculated</h2>
+              <div class="fine">Allowed capacity: <code>capacityAt(MCT88, jibLength, targetRadius)</code> — flat 5 t to corner (16.2 m for 30 m jib), then <code>81 / radius</code>. Utilization: <code>load / capacity</code>. Load moment: <code>load × radius</code> vs limit <code>81 t·m</code>. Exclusion-zone: <code>hookInZone()</code> on target ground position. Building: <code>buildingClearance()</code> on target hook position. Thresholds: <code>&lt;0.90 SAFE</code> · <code>0.90–&lt;1.00 WARNING</code> · <code>≥1.00 DANGER</code> (same as live simulation).</div>
             </section>
           </div>
 
