@@ -67,6 +67,15 @@ capacity(r) = M_max / r
 
 A radius beyond the installed jib length is out of range: the model returns no capacity instead of extrapolating. This is an idealized teaching model. Actual crane load charts can contain additional structural, reeving, configuration, and derating constraints, so this equation should not be mistaken for the complete manufacturer load chart.
 
+### Wind derating (SIMULATED PRODUCT RULE — not certified)
+
+- Threshold: 20 km/h (derate active at `windKmh >= 20`, hidden below).
+- Factor: rated capacity × 0.8, applied to the final base capacity (`capacityAt(model, jibM, radiusM, windKmh)`).
+- Purpose: simulated capacity derating driven by the numeric wind-speed input (0–60 km/h, 1 km/h steps).
+- Status: product-requested simulation rule. The ticket cites "EN 14439 Table 7", but the available project sources do not contain that table text, so the citation is unverified (see `docs/SOURCES.md` §6).
+- Certification: not a certified wind-load calculation. Cycle 2 validation remains the baseline/no-wind validation.
+- UI: SAFE / WARNING / DANGER = load utilization status; DERATED = wind-based capacity reduction is active (separate indicator).
+
 ## Current Crane Configuration
 
 Configuration used by the prototype and its validation:
@@ -193,6 +202,7 @@ then open `http://localhost:8000`.
 - **Syntax:** `node --check script.js`, `node --check capacity.js` (plain scripts, file:// compatible, no modules).
 - **Engineering validation:** `validate(MCT88, 30, CHART30)` runs in the browser console on boot against the three published chart points above; the Validation tab renders the same comparison.
 - **Round 1 scenario verification:** `node tests/verify-round1.js` checks that the four required jib/radius/load combinations reach the calculation layer without being rounded or clamped, and that a radius beyond the installed jib returns out-of-range. It also verifies the slider bounds in `index.html`.
+- **Round 3 wind-derate verification:** `node tests/verify-wind-derating.js` checks the 0.8× simulated product rule (no-wind baseline, 19/20/25 km/h, corner region, out-of-range null).
 - **Cycle 2 validation:** worst error 8.4% against the ±10% acceptance threshold — PASS (see table above).
 
 ## Limitations
@@ -202,7 +212,7 @@ then open `http://localhost:8000`.
 - Actual crane operation may involve additional chart, configuration, reeving, and derating constraints.
 - No live physical crane sensor feed is currently connected.
 - No structural dynamics model.
-- No wind-load physics model (wind is a visual/status input, not a computed load effect).
+- No wind-load physics model (Round 3 adds a SIMULATED 0.8× product derate at ≥ 20 km/h; not a certified wind-load calculation. The categorical LOW/MODERATE/HIGH wind remains visual only).
 - No certified lift planning.
 - No production operational deployment.
 

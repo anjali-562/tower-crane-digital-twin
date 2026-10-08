@@ -65,3 +65,22 @@ The following are project or starter-kit choices, not brochure figures:
 - Open item: the metric-edition per-radius row for the 30 m jib
   (which would remove the imperial → metric conversion). If it is
   supplied, `CHART30` gets replaced and re-validated.
+
+## 6. Round 3 wind-derate note (SIMULATED PRODUCT RULE, citation unverified)
+
+- Round 3 ticket specifies: wind speed at or above 20 km/h → rated
+  capacity × 0.8, described as "per EN 14439 Table 7".
+- The available project sources (manufacturer e-catalogue reference,
+  MCT 88 Data Sheet FEM 1.001-A3 load-charts page as mirrored, and the
+  starter-kit notes above) do NOT contain the cited Table 7 text, a 0.8
+  wind factor, or a 20 km/h wind-derate threshold. The citation has
+  therefore NOT been independently verified from project evidence.
+- Implemented strictly as a product-requested simulation rule:
+  `capacityAt(model, jibM, radiusM, windKmh)` returns the existing base
+  capacity when `windKmh` is absent or < 20 km/h, and `base × 0.8` when
+  `windKmh >= 20 km/h` (out-of-range `null` stays `null`).
+- This is a simplified simulation rule, NOT a certified wind-load
+  calculation. No new published wind-rated chart data was supplied, so
+  the existing Cycle 2 validation (30 m jib, ±10%) remains the
+  baseline/no-wind validation; the derated model is not claimed to be
+  validated against the manufacturer chart.
