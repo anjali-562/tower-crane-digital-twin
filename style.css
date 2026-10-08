@@ -225,6 +225,15 @@ button:active{transform:translateY(1px)}
 .risk.low{background:var(--ok-bg); color:var(--ok); border-color:var(--ok)}
 .risk.mid{background:var(--warn-bg); color:var(--warn); border-color:var(--warn)}
 .risk.high{background:var(--bad-bg); color:var(--bad); border-color:var(--bad)}
+/* ROUND 3 — separate DERATED indicator (wind derate active). Not a risk level:
+   SAFE/WARNING/DANGER = utilization; DERATED = capacity was reduced by wind. */
+.derate{
+  display:flex; align-items:center; justify-content:center; gap:8px;
+  font-weight:800; padding:10px; border-radius:var(--radius);
+  font-size:12.5px; letter-spacing:1px; border:1px dashed var(--info);
+  background:var(--inset); color:var(--info); margin:2px 0 4px; text-align:center;
+}
+.derate.hidden{display:none}
 #vStatus.risk{font-size:13.5px; padding:11px 10px}
 
 /* Detail views (driven by the sidebar; tab bar kept hidden for script.js) */

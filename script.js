@@ -67,7 +67,7 @@ const S = {
   mode: 'manual', playing: true, speed: 1,
   hoist: 24, trolley: 20, slew: 0,          // actual (animated)
   tHoist: 24, tTrolley: 20, tSlew: 0,       // targets
-  load: 2.0, jibLen: 30, wind: 'moderate',
+  load: 2.0, jibLen: 30, wind: 'moderate', windKmh: 0,
   obstaclesOn: true, exclOn: true,
   crane2Mode: 'on', config: 'standard',
   autoStep: -1, autoTimer: 0, attached: false, autoHold: null,
@@ -95,7 +95,10 @@ const CHART30 = [
   { radiusM: 25.0, chartT: 2.99 },
   { radiusM: 29.9, chartT: 2.54 },
 ];
-function capNow(r) { return capacityAt(MCT88, S.jibLen, r); }
+function capNow(r) { return capacityAt(MCT88, S.jibLen, r, S.windKmh); }
+// ROUND 3 — SIMULATED PRODUCT RULE: derate active at >= 20 km/h (see capacity.js).
+// Separate concept from SAFE/WARNING/DANGER (utilization status).
+function isDerated() { return isFinite(S.windKmh) && S.windKmh >= 20; }
 function momentNow() { return tipLoadAt(MCT88, S.jibLen) * S.jibLen; }
 function cornerNow() { return momentNow() / MCT88.maxCapacityT; }
 function pctErr(model, real) { return real > 0 ? Math.abs(model - real) / real * 100 : 0; }
@@ -613,6 +616,7 @@ function updateUI() {
   $('vSlew').textContent = Math.round(S.tSlew) + '°';
   $('vLoad').textContent = S.load.toFixed(1) + ' t';
   $('vJib').textContent = fmtJib(S.jibLen);
+  const vW = $('vWindKmh'); if (vW) vW.textContent = S.windKmh + ' km/h';
   $('rLoad').textContent = S.load.toFixed(2) + ' t';
   $('rRadius').textContent = S.trolley.toFixed(2) + ' m';
   $('rHook').textContent = S.hoist.toFixed(1) + ' m';
@@ -634,7 +638,14 @@ function updateUI() {
   const capLine = $('capStatusLine');
   if (capLine) {
     const st = S.risk === 'high' ? 'DANGER' : (S.risk === 'mid' ? 'WARNING' : 'SAFE');
-    capLine.textContent = `STATUS: ${st} · LOAD ${S.load.toFixed(2)} t · RADIUS ${S.trolley.toFixed(2)} m · CAPACITY ${cap == null ? '—' : cap.toFixed(2) + ' t'} · UTIL ${ut > 9 ? '—' : (ut * 100).toFixed(1) + '%'}`;
+    const der = isDerated() ? ' · DERATED (WIND ' + S.windKmh + ' km/h ×0.8, SIMULATED PRODUCT RULE)' : '';
+    capLine.textContent = `STATUS: ${st} · LOAD ${S.load.toFixed(2)} t · RADIUS ${S.trolley.toFixed(2)} m · CAPACITY ${cap == null ? '—' : cap.toFixed(2) + ' t'} · UTIL ${ut > 9 ? '—' : (ut * 100).toFixed(1) + '%'}${der}`;
+  }
+  const derBadge = $('derateBadge');
+  if (derBadge) {
+    const on = isDerated();
+    derBadge.className = 'derate' + (on ? '' : ' hidden');
+    if (on) derBadge.textContent = `DERATED — WIND ${S.windKmh} km/h ≥ 20 km/h (0.8×, SIMULATED PRODUCT RULE)`;
   }
   // Constraints tab live text (STARTER-KIT §6 wording)
   const ex = $('exclStatus'), bl = $('bldgStatus');
@@ -658,7 +669,7 @@ function updateUI() {
     $('liftBar').style.width = '0';
   }
   // LIVE LOAD-CAPACITY CHART: must follow every lift/movement (trolley, load, jib, risk, planner, auto)
-  const ck = S.jibLen + '|' + S.trolley.toFixed(2) + '|' + S.load.toFixed(2) + '|' + S.risk + '|' + (plannerLast ? plannerLast.radius.toFixed(1) + '/' + plannerLast.load.toFixed(1) : '-');
+  const ck = S.jibLen + '|' + S.trolley.toFixed(2) + '|' + S.load.toFixed(2) + '|' + S.risk + '|' + S.windKmh + '|' + (plannerLast ? plannerLast.radius.toFixed(1) + '/' + plannerLast.load.toFixed(1) : '-');
   if (ck !== lastChartKey) { lastChartKey = ck; drawChart(); }
   const slewHint = $('plSlewHint'); if (slewHint) slewHint.textContent = Math.round(S.slew) + '°';
 }
@@ -746,11 +757,14 @@ function runAutomaticLift(dt) {
 // ---------- resetSimulation ----------
 function resetSimulation() {
   S.tHoist = 24; S.tTrolley = 20; S.tSlew = 0; S.load = 2; S.jibLen = 30; // 30 m validation jib
+  S.windKmh = 0;
   S.autoStep = -1; S.mode = 'manual'; S.autoHold = null;
   S.attached = false; S.conflicts = []; S.exclHit = null; S.bldgHit = null; S.bldgNear = null;
   S.cap = null; S.util = null;
   $('sHoist').value = 24; $('sTrolley').value = 20; $('sSlew').value = 0; $('sLoad').value = 2;
   $('sJib').value = 30; $('sTrolley').max = 53.1; $('sTrolley').min = 2;
+  const sW = $('sWindKmh'); if (sW) sW.value = 0;
+  const vW = $('vWindKmh'); if (vW) vW.textContent = '0 km/h';
   [...slewGroup.children].filter(o => o.userData.pendant).forEach(o => slewGroup.remove(o));
   rebuildJib();
   lastChartKey = ''; plannerLast = null; plannerTarget = null;
@@ -823,6 +837,13 @@ function wireUI() {
     drawChart();
   });
   $('selWind').addEventListener('change', e => S.wind = e.target.value);
+  // ROUND 3 numeric wind-speed engineering input (0–60 km/h). This drives
+  // capacityAt(..., windKmh). The LOW/MODERATE/HIGH select above stays visual only.
+  $('sWindKmh').addEventListener('input', e => {
+    S.windKmh = Math.max(0, Math.min(60, Math.round(+e.target.value)));
+    const vW = $('vWindKmh'); if (vW) vW.textContent = S.windKmh + ' km/h';
+    lastChartKey = ''; drawChart();
+  });
   $('selCrane2').addEventListener('change', e => {
     S.crane2Mode = e.target.value;
     scene.userData.crane2.visible = S.crane2Mode !== 'off';
@@ -925,7 +946,7 @@ function drawChart() {
   ctx.strokeStyle = '#f5a623'; ctx.lineWidth = 2; ctx.setLineDash([6, 4]); ctx.beginPath();
   let started = false;
   for (let r = 0.5; r <= jib; r += 0.25) {
-    const c = capacityAt(MCT88, jib, r);
+    const c = capacityAt(MCT88, jib, r, S.windKmh);
     const x = X(r), y = Y(c);
     if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
   }

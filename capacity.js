@@ -34,13 +34,33 @@ function tipLoadAt(model, jibM) {
 // capacity(r) = maxCapacityT           for r <= cornerR   (cornerR = M / maxCapacityT)
 // capacity(r) = M / r                  for r >  cornerR   (M = tipLoadAt(model,jibM) * jibM)
 // return null if radiusM > jibM; return maxCapacityT if radiusM <= 0.
-function capacityAt(model, jibM, radiusM) {
-  if (radiusM <= 0) return model.maxCapacityT;
+//
+// ROUND 3 — SIMULATED PRODUCT RULE (wind derate, NOT verified against EN 14439):
+// Optional 4th argument windKmh (km/h). The Round 3 ticket cites
+// "0.8 derate at wind >= 20 km/h per EN 14439 Table 7", but the available
+// project sources do not contain that table text, so the citation is
+// unverified. Implemented as a product-requested simulation rule only:
+//   windKmh undefined/null or < 20  -> return base capacity (unchanged)
+//   windKmh >= 20                    -> return base capacity * 0.8
+// Out-of-range (radiusM > jibM) still returns null, never a number.
+// Tip table, moment M and corner radius are NOT modified; the factor applies
+// to the final base rated capacity. Not a certified wind-load calculation.
+function capacityAt(model, jibM, radiusM, windKmh) {
+  var base;
   if (radiusM > jibM) return null;
-  var M = tipLoadAt(model, jibM) * jibM;
-  var cornerR = M / model.maxCapacityT;
-  if (radiusM <= cornerR) return model.maxCapacityT;
-  return M / radiusM;
+  if (radiusM <= 0) {
+    base = model.maxCapacityT;
+  } else {
+    var M = tipLoadAt(model, jibM) * jibM;
+    var cornerR = M / model.maxCapacityT;
+    if (radiusM <= cornerR) base = model.maxCapacityT;
+    else base = M / radiusM;
+  }
+  if (windKmh === undefined || windKmh === null) return base;
+  var w = Number(windKmh);
+  if (!isFinite(w)) return base;
+  if (w >= 20) return base * 0.8;
+  return base;
 }
 
 // Validation harness (given). Fill `chart` with values READ from a real published chart.

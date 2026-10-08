@@ -158,7 +158,9 @@
         <section class="panel-block status">
           <h2>Capacity status</h2>
           <div id="riskBadge" class="risk low">WITHIN CAPACITY</div>
+          <div id="derateBadge" class="derate hidden">DERATED — WIND ≥ 20 km/h (0.8×, SIMULATED PRODUCT RULE)</div>
           <div class="fine">Thresholds: &lt;0.90 SAFE · 0.90–&lt;1.00 WARNING · ≥1.00 DANGER.</div>
+          <div class="fine">SAFE / WARNING / DANGER = load utilization status. DERATED = wind-based capacity reduction is active (separate concept).</div>
           <div class="fine" id="capStatusLine">STATUS: —</div>
         </section>
 
@@ -210,6 +212,9 @@
             </div>
             <div class="factor"><label for="selGate">Site access gate</label>
               <select id="selGate"><option value="open" selected>OPEN</option><option value="restricted">RESTRICTED</option></select></div>
+            <div class="factor"><label for="sWindKmh">Wind speed (engineering input) <b id="vWindKmh">0 km/h</b></label>
+              <input id="sWindKmh" type="range" min="0" max="60" step="1" value="0" /></div>
+            <div class="fine">Wind derate (SIMULATED PRODUCT RULE): ≥ 20 km/h → rated capacity × 0.8. Below 20 km/h → no derate. The EN 14439 Table 7 citation in the request could not be verified from project sources — not a certified wind-load calculation. LOW / MODERATE / HIGH above is visual only and is not used as the engineering input.</div>
             <div class="toggles">
               <label><input type="checkbox" id="tZones" checked /> Exclusion zones</label>
               <label><input type="checkbox" id="tEnvelope" checked /> Crane envelope</label>
