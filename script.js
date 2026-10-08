@@ -427,8 +427,11 @@ function updateCraneMovement(dt) {
   } else {
     runAutomaticLift(dt);
   }
-  // clamp (installed jib; trolley 4 m to jib-1 (simulated))
-  S.trolley = THREE.MathUtils.clamp(S.trolley, 4, S.jibLen - 1);
+  // clamp to ABSOLUTE trolley-slider bounds (2 m to max MCT 88 jib 53.1 m).
+  // Do NOT clamp to the installed jib here: a radius beyond the installed jib
+  // must survive to capacityAt(), which returns null (out-of-range) there.
+  S.trolley = THREE.MathUtils.clamp(S.trolley, 2, 53.1);
+  S.tTrolley = THREE.MathUtils.clamp(S.tTrolley, 2, 53.1);
   S.hoist = THREE.MathUtils.clamp(S.hoist, 1.5, MAST_TOP() - 1);
   // apply to scene
   const topY = slewGroup.position.y;
@@ -562,7 +565,7 @@ function updateCollisionDetection() {
   S.bldgHit = bldgHit; S.bldgNear = bldgNear;
 
   // --- Jib reach: radius beyond installed jib (capacityAt returns null there) ---
-  if (cap == null) conf.push({ type: 'bad', msg: `DANGER — radius ${r.toFixed(1)} m beyond ${S.jibLen} m jib (out of chart)` });
+  if (cap == null) conf.push({ type: 'bad', msg: `DANGER — radius ${r.toFixed(1)} m beyond ${fmtJib(S.jibLen)} jib (out of chart)` });
   if (S.hoist < 2.2) conf.push({ type: 'warn', msg: 'SIMULATED WARNING — hook near ground' });
 
   // --- Exclusion-zone test via hookInZone() (STARTER-KIT §6, obstacle avoidance) ---
@@ -598,6 +601,9 @@ function updateWind() { /* sway + arrows handled in movement; banner in collisio
 
 // ---------- updateUI ----------
 const $ = id => document.getElementById(id);
+// Jib display: exact installed length without float artefacts
+// (30 -> "30 m", 27.5 -> "27.5 m", 53.1 -> "53.1 m").
+function fmtJib(j) { return (Math.round(j * 10) / 10) + ' m'; }
 const STEPS = ['STEP 1 — PICKUP', 'STEP 2 — HOIST (LOWER)', 'STEP 3 — LOAD ATTACHED ✓', 'STEP 4 — HOISTING LOAD', 'STEP 5 — TROLLEY TRAVEL', 'STEP 6 — SLEWING TO TARGET', 'STEP 7 — CAPACITY + EXCLUSION CHECKS', 'STEP 8 — LOWERING TO FLOOR', 'STEP 9 — LOAD PLACED ✓', 'STEP 10 — HOOK RETURNING'];
 let uiTick = 0;
 function updateUI() {
@@ -606,12 +612,12 @@ function updateUI() {
   $('vTrolley').textContent = S.tTrolley.toFixed(1) + ' m';
   $('vSlew').textContent = Math.round(S.tSlew) + '°';
   $('vLoad').textContent = S.load.toFixed(1) + ' t';
-  $('vJib').textContent = S.jibLen + ' m';
+  $('vJib').textContent = fmtJib(S.jibLen);
   $('rLoad').textContent = S.load.toFixed(2) + ' t';
   $('rRadius').textContent = S.trolley.toFixed(2) + ' m';
   $('rHook').textContent = S.hoist.toFixed(1) + ' m';
-  const rj = $('rJib'); if (rj) rj.textContent = S.jibLen + ' m';
-  const rjt = $('rJibTop'); if (rjt) rjt.textContent = S.jibLen + ' m';
+  const rj = $('rJib'); if (rj) rj.textContent = fmtJib(S.jibLen);
+  const rjt = $('rJibTop'); if (rjt) rjt.textContent = fmtJib(S.jibLen);
   const cl = $('cornerLine');
   if (cl) cl.textContent = `Corner radius: ${cornerNow().toFixed(1)} m · Moment: ${momentNow().toFixed(1)} t·m · Source: MCT 88 datasheet (see REAL CRANE tab).`;
   const cap = S.cap !== undefined && S.cap !== null ? S.cap : capNow(S.trolley);
@@ -744,7 +750,7 @@ function resetSimulation() {
   S.attached = false; S.conflicts = []; S.exclHit = null; S.bldgHit = null; S.bldgNear = null;
   S.cap = null; S.util = null;
   $('sHoist').value = 24; $('sTrolley').value = 20; $('sSlew').value = 0; $('sLoad').value = 2;
-  $('sJib').value = 30; $('sTrolley').max = 29;
+  $('sJib').value = 30; $('sTrolley').max = 53.1; $('sTrolley').min = 2;
   [...slewGroup.children].filter(o => o.userData.pendant).forEach(o => slewGroup.remove(o));
   rebuildJib();
   lastChartKey = ''; plannerLast = null; plannerTarget = null;
@@ -807,9 +813,10 @@ function wireUI() {
   $('sSlew').addEventListener('input', e => { S.tSlew = +e.target.value; if (S.mode === 'auto') { S.mode = 'manual'; S.autoStep = -1; syncModeButtons(); } });
   $('sLoad').addEventListener('input', e => { S.load = +e.target.value; });
   $('sJib').addEventListener('input', e => {
-    S.jibLen = +e.target.value;
-    $('sTrolley').max = S.jibLen - 1;
-    if (S.tTrolley > S.jibLen - 1) { S.tTrolley = S.jibLen - 1; syncSliders(); }
+    S.jibLen = Math.round(+e.target.value * 10) / 10;
+    // NOTE: trolley slider keeps its ABSOLUTE bounds (2–53.1 m). Do not clamp
+    // the working radius to the installed jib: radius > jib must reach
+    // capacityAt() so it returns null (out-of-range) instead of being hidden.
     // drop pendants then rebuild
     [...slewGroup.children].filter(o => o.userData.pendant).forEach(o => slewGroup.remove(o));
     rebuildJib();
@@ -826,8 +833,8 @@ function wireUI() {
   $('selGate').addEventListener('change', e => { $('opDetail').textContent = 'Site gate: ' + e.target.value.toUpperCase() + ' (simulated access state)'; });
   $('selConfig').addEventListener('change', e => {
     S.config = e.target.value;
-    if (S.config === 'short') { S.jibLen = 20; $('sJib').value = 20; $('sTrolley').max = 19; [...slewGroup.children].filter(o => o.userData.pendant).forEach(o => slewGroup.remove(o)); rebuildJib(); drawChart(); }
-    if (S.config === 'standard') { S.jibLen = 30; $('sJib').value = 30; $('sTrolley').max = 29; [...slewGroup.children].filter(o => o.userData.pendant).forEach(o => slewGroup.remove(o)); rebuildJib(); drawChart(); }
+    if (S.config === 'short') { S.jibLen = 20; $('sJib').value = 20; [...slewGroup.children].filter(o => o.userData.pendant).forEach(o => slewGroup.remove(o)); rebuildJib(); drawChart(); }
+    if (S.config === 'standard') { S.jibLen = 30; $('sJib').value = 30; [...slewGroup.children].filter(o => o.userData.pendant).forEach(o => slewGroup.remove(o)); rebuildJib(); drawChart(); }
   });
   // Tabs (Cycle 2 panels — simulation stays default)
   document.querySelectorAll('.tabs button').forEach(b => b.addEventListener('click', () => {
@@ -969,7 +976,7 @@ function drawChart() {
   if (elA) elA.textContent = curCap == null ? 'OUT OF RANGE' : curCap.toFixed(2) + ' t';
   if (elU) elU.textContent = curUtil == null || curUtil > 9 ? '—' : (curUtil * 100).toFixed(1) + '%';
   if (elRisk) { elRisk.textContent = S.risk === 'high' ? 'DANGER' : (S.risk === 'mid' ? 'WARNING' : 'SAFE'); elRisk.className = S.risk === 'high' ? 'tone-bad' : (S.risk === 'mid' ? 'tone-warn' : 'tone-ok'); }
-  if (elJ) elJ.textContent = jib + ' m';
+  if (elJ) elJ.textContent = fmtJib(jib);
 }
 
 // ---------- Lift Planner (simulation-based engineering check) ----------
