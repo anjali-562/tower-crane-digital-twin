@@ -14,10 +14,10 @@ const path = require('path');
 const vm = require('vm');
 
 const dir = __dirname;
-const srcDir = path.join(dir, '..', 'src');
-const capSrc = fs.readFileSync(path.join(srcDir, 'capacity.js'), 'utf8');
-const html = fs.readFileSync(path.join(srcDir, 'index.html'), 'utf8');
-const js = fs.readFileSync(path.join(srcDir, 'script.js'), 'utf8');
+const rootDir = path.join(dir, '..');
+const capSrc = fs.readFileSync(path.join(rootDir, 'capacity.js'), 'utf8');
+const html = fs.readFileSync(path.join(rootDir, 'index.html'), 'utf8');
+const js = fs.readFileSync(path.join(rootDir, 'script.js'), 'utf8');
 
 // --- Load capacity.js globals (var MCT88 / tipLoadAt / capacityAt / ...) ---
 vm.runInThisContext(capSrc, { filename: 'capacity.js' });

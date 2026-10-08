@@ -37,7 +37,7 @@ Everything runs as a static HTML/JavaScript application with no build step and n
 
 ## Engineering Model
 
-Capacity follows an idealized load-moment model implemented in `src/capacity.js` (`capacityAt()`). The tip load for the installed jib is taken from the published MCT 88 tip-load table (interpolated between table rows where needed).
+Capacity follows an idealized load-moment model implemented in `capacity.js` (`capacityAt()`). The tip load for the installed jib is taken from the published MCT 88 tip-load table (interpolated between table rows where needed).
 
 ### Maximum Load Moment
 
@@ -151,44 +151,48 @@ Not yet implemented:
 
 ```text
 tower-crane-digital-twin/
+├── index.html              # simulation entry point (also served by GitHub Pages)
+├── script.js
+├── style.css
+├── capacity.js
+├── ui-mirror.js
 ├── README.md
 ├── docs/
 │   ├── CYCLE2_SUMMARY.md
 │   ├── SOURCES.md
 │   ├── validation-calculation.txt
 │   └── reference/            # student/Cycle 3 material, not part of the Cycle 2 deliverable
-├── src/
-│   ├── index.html
-│   ├── script.js
-│   ├── style.css
-│   ├── capacity.js
-│   └── ui-mirror.js
 └── tests/
     └── verify-round1.js
 ```
 
+The web app lives at the repository root so the GitHub Pages URL
+(`https://<username>.github.io/<repository>/`) opens the simulation
+directly. `README.md` stays repository documentation; `index.html`
+stays the application.
+
 ## Run Locally
 
-No build step, no dependencies to install. The 3D view loads Three.js r128 from a CDN, so an internet connection is needed for the CDN scripts; the engineering model itself (`src/capacity.js`) is local.
+No build step, no dependencies to install. The 3D view loads Three.js r128 from a CDN, so an internet connection is needed for the CDN scripts; the engineering model itself (`capacity.js`) is local.
 
 1. Clone the repository.
-2. Open `src/index.html` in Chrome or Edge.
+2. Open `index.html` in Chrome or Edge.
 
 If opening over `file://` is unreliable in your browser, serve the folder with any simple static server instead, for example:
 
 ```bash
-npx serve src
+npx serve .
 # or
-python -m http.server --directory src 8000
+python -m http.server 8000
 ```
 
 then open `http://localhost:8000`.
 
 ## Validation / Testing
 
-- **Syntax:** `node --check src/script.js`, `node --check src/capacity.js` (plain scripts, file:// compatible, no modules).
+- **Syntax:** `node --check script.js`, `node --check capacity.js` (plain scripts, file:// compatible, no modules).
 - **Engineering validation:** `validate(MCT88, 30, CHART30)` runs in the browser console on boot against the three published chart points above; the Validation tab renders the same comparison.
-- **Round 1 scenario verification:** `node tests/verify-round1.js` checks that the four required jib/radius/load combinations reach the calculation layer without being rounded or clamped, and that a radius beyond the installed jib returns out-of-range. It also verifies the slider bounds in `src/index.html`.
+- **Round 1 scenario verification:** `node tests/verify-round1.js` checks that the four required jib/radius/load combinations reach the calculation layer without being rounded or clamped, and that a radius beyond the installed jib returns out-of-range. It also verifies the slider bounds in `index.html`.
 - **Cycle 2 validation:** worst error 8.4% against the ±10% acceptance threshold — PASS (see table above).
 
 ## Limitations

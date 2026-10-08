@@ -104,7 +104,7 @@ Reproduce: `validate(MCT88, 30, CHART30)` in the browser console.
 
 ## 10. Verification status
 
-- `node --check src/script.js` / `src/capacity.js` — clean.
+- `node --check script.js` / `capacity.js` — clean.
 - `node tests/verify-round1.js` — all checks pass: the four required
   jib / radius / load combinations reach the calculation layer
   unrounded and unclamped; radius beyond the installed jib returns

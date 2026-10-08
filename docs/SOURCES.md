@@ -40,8 +40,8 @@ quotes real brochure figures). Conversions are shown explicitly.
   66 ft = 20.1 m → 4.3 USt = 3.90 t;
   82 ft = 25.0 m → 3.3 USt = 2.99 t;
   98 ft = 29.9 m → 2.8 USt = 2.54 t.
-- Stored in `src/script.js` as `CHART30` and checked with
-  `validate(MCT88, 30, CHART30)` from `src/capacity.js`.
+- Stored in `script.js` as `CHART30` and checked with
+  `validate(MCT88, 30, CHART30)` from `capacity.js`.
 
 ## 4. Date accessed
 
