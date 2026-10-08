@@ -1,0 +1,54 @@
+VALIDATION CALCULATION — Potain MCT 88 (C25), 30 m jib
+====================================================
+Manual validation example. The team still hand-writes this on paper
+and photographs it. It does NOT replace the manufacturer load chart.
+Sources: project starter-kit tip table; Potain MCT 88 Data Sheet
+FEM 1.001-A3, "Load charts" page, 98 ft row (see SOURCES.md).
+
+1. TIP LOAD (published, 30 m jib)
+----------------------------------
+tip = 2.70 t
+
+2. LOAD MOMENT
+--------------
+M = tip x jib
+M = 2.70 x 30
+M = 81 t·m
+
+3. MAXIMUM CAPACITY (published)
+-------------------------------
+maxCap = 5 t
+
+4. CORNER RADIUS
+----------------
+corner = M / maxCap
+corner = 81 / 5
+corner = 16.2 m
+
+5. TWO-PIECE RULE
+-----------------
+r <= 16.2 m : capacity = 5 t
+r >  16.2 m : capacity = 81 / r
+
+6. CAPACITY AT 20 m (hand-derivation point)
+-------------------------------------------
+20 > 16.2, so capacity = 81 / 20
+capacity(20 m) = 4.05 t
+
+7. SANITY CHECKS
+----------------
+capacity( 5.0 m) = 5.00 t   (inside corner -> flat region)
+capacity(16.2 m) = 5.00 t   (the corner itself)
+capacity(20.0 m) = 4.05 t   (81 / 20)
+capacity(25.0 m) = 3.24 t   (81 / 25)
+capacity(30.0 m) = 2.70 t   (81 / 30 <- equals the tip load, as it must)
+
+8. THREE-POINT VALIDATION (model vs published per-radius chart, 30 m jib)
+-------------------------------------------------------------------------
+r = 20.1 m : model 81 / 20.1 = 4.03 t, chart 3.90 t, err 3.3 %
+r = 25.0 m : model 81 / 25.0 = 3.24 t, chart 2.99 t, err 8.4 %
+r = 29.9 m : model 81 / 29.9 = 2.71 t, chart 2.54 t, err 6.7 %
+
+WORST = 8.4 %    TARGET <= 10 %    =>  PASS
+
+(Reproduce by running validate(MCT88, 30, CHART30) in the console.)

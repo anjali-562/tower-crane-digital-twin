@@ -1085,7 +1085,7 @@ function useAsDemo() {
 // ---------- Boot ----------
 try {
   if (typeof capacityAt !== 'function' || typeof hookInZone !== 'function' || typeof MCT88 === 'undefined') {
-    throw new Error('capacity.js did not load — MCT88/capacityAt/hookInZone missing. Keep capacity.js next to index.html.');
+    throw new Error('capacity.js did not load — MCT88/capacityAt/hookInZone missing. Keep capacity.js next to index.html in src/.');
   }
   if (!renderer.capabilities) throw new Error('WebGL unavailable');
   createSite();

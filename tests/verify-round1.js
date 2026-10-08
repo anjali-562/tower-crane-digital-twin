@@ -1,5 +1,5 @@
 // verify-round1.js — DGOC Round 1 "Predict, then run" verification (Cycle 2).
-// No dependencies. Run:  node verify-round1.js
+// No dependencies. Run from this folder:  node verify-round1.js
 // Checks:
 //  (a) UI slider bounds in index.html admit the exact Round 1 inputs
 //      (jib 53.1/35/27.5/30, radius 3/23/34/46) — i.e. no snap/round/clamp;
@@ -14,9 +14,10 @@ const path = require('path');
 const vm = require('vm');
 
 const dir = __dirname;
-const capSrc = fs.readFileSync(path.join(dir, 'capacity.js'), 'utf8');
-const html = fs.readFileSync(path.join(dir, 'index.html'), 'utf8');
-const js = fs.readFileSync(path.join(dir, 'script.js'), 'utf8');
+const srcDir = path.join(dir, '..', 'src');
+const capSrc = fs.readFileSync(path.join(srcDir, 'capacity.js'), 'utf8');
+const html = fs.readFileSync(path.join(srcDir, 'index.html'), 'utf8');
+const js = fs.readFileSync(path.join(srcDir, 'script.js'), 'utf8');
 
 // --- Load capacity.js globals (var MCT88 / tipLoadAt / capacityAt / ...) ---
 vm.runInThisContext(capSrc, { filename: 'capacity.js' });
