@@ -359,10 +359,18 @@ function getComputedUtilization() {
   return S.load / cap;
 }
 
+function getCurrentTelemetryRow() {
+  if (T.rowIndex > 0 && T.rowIndex <= T.rows.length) {
+    return T.rows[T.rowIndex - 1];
+  }
+  return null;
+}
+
 // Expose for integration
 window.TelemetryAPI = {
   getDeviceMomentPct,
   getComputedUtilization,
+  getCurrentTelemetryRow,
   getTelemetryState: () => ({ mode: T.mode, playing: T.playing, rowIndex: T.rowIndex, totalRows: T.rows.length, speed: T.speed }),
 };
 
@@ -935,6 +943,63 @@ function updateUI() {
   const ck = S.jibLen + '|' + S.trolley.toFixed(2) + '|' + S.load.toFixed(2) + '|' + S.risk + '|' + S.windKmh + '|' + (plannerLast ? plannerLast.radius.toFixed(1) + '/' + plannerLast.load.toFixed(1) : '-');
   if (ck !== lastChartKey) { lastChartKey = ck; drawChart(); }
   const slewHint = $('plSlewHint'); if (slewHint) slewHint.textContent = Math.round(S.slew) + '°';
+
+  // Divergence badge (Cycle 3 — Namya): only in LIVE mode with telemetry loaded
+  updateDivergenceBadge();
+}
+
+function updateDivergenceBadge() {
+  const divBlock = $('divergenceBlock');
+  const divDevice = $('divDevice');
+  const divComputed = $('divComputed');
+  const divDiff = $('divDiff');
+  const divBadge = $('divBadge');
+  const divReason = $('divReason');
+  if (!divBlock || !divDevice || !divComputed || !divDiff || !divBadge || !divReason) return;
+
+  // Only show in LIVE mode with telemetry loaded
+  if (T.mode !== 'live' || T.rows.length === 0) {
+    divBlock.style.display = 'none';
+    return;
+  }
+  divBlock.style.display = 'block';
+
+  const row = getCurrentTelemetryRow();
+  if (!row) {
+    divDevice.textContent = '—';
+    divComputed.textContent = '—';
+    divDiff.textContent = '—';
+    divBadge.textContent = 'NO DATA';
+    divBadge.className = 'div-badge div-invalid';
+    divReason.textContent = 'No telemetry row available';
+    return;
+  }
+
+  const config = {
+    jibLen: S.jibLen,
+    windKmh: S.windKmh,
+    thresholdPct: 5  // configurable default: 5 percentage points
+  };
+
+  const result = window.DivergenceAPI.computeDivergence(row, config);
+
+  divDevice.textContent = window.DivergenceAPI.formatPct(result.deviceMomentPct);
+  divComputed.textContent = window.DivergenceAPI.formatPct(result.computedUtilPct);
+  divDiff.textContent = window.DivergenceAPI.formatPct(result.divergencePct);
+
+  if (result.status === 'invalid') {
+    divBadge.textContent = 'UNAVAILABLE';
+    divBadge.className = 'div-badge div-invalid';
+    divReason.textContent = result.reason || 'Invalid or missing data';
+  } else {
+    divBadge.textContent = window.DivergenceAPI.getStatusText(result.status);
+    divBadge.className = 'div-badge ' + window.DivergenceAPI.getStatusClass(result.status);
+    if (result.status === 'divergent') {
+      divReason.textContent = `Difference ${result.divergencePct.toFixed(1)} pp exceeds ${config.thresholdPct} pp threshold`;
+    } else {
+      divReason.textContent = `Values agree within ${config.thresholdPct} pp threshold`;
+    }
+  }
 }
 
 // ---------- runAutomaticLift (uses REAL chart + geometric checks each stage) ----------

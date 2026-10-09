@@ -167,6 +167,30 @@
             <div class="trow"><span>Corner radius</span><b id="rCorner">16.2 m</b></div>
             <div class="trow"><span>Hook height</span><b id="rHook">24.0 m</b></div>
           </div>
+
+          <!-- Divergence Badge (Cycle 3 — Namya) -->
+          <section class="panel-block divergence" style="margin-top:10px; display:none;" id="divergenceBlock">
+            <h2>Device vs Computed Utilisation</h2>
+            <div class="div-grid">
+              <div class="div-row">
+                <span class="div-label">Device moment %</span>
+                <b id="divDevice" class="div-value">—</b>
+              </div>
+              <div class="div-row">
+                <span class="div-label">Computed util %</span>
+                <b id="divComputed" class="div-value">—</b>
+              </div>
+              <div class="div-row">
+                <span class="div-label">Difference</span>
+                <b id="divDiff" class="div-value">—</b>
+              </div>
+              <div class="div-row div-status-row">
+                <span class="div-label">Status</span>
+                <div id="divBadge" class="div-badge">—</div>
+              </div>
+            </div>
+            <div class="fine" id="divReason">Awaiting telemetry…</div>
+          </section>
           <div class="fine" id="cornerLine">Corner radius: 16.2 m · Moment: 81 t·m · Source: MCT 88 datasheet (see Crane Data).</div>
         </section>
 
@@ -426,6 +450,7 @@
 <div id="glError" class="gl-error hidden"></div>
 
 <script src="capacity.js"></script>
+<script src="divergence.js"></script>
 <script src="script.js"></script>
 <script src="ui-mirror.js"></script>
 </body>
