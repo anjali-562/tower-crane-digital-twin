@@ -268,6 +268,12 @@ table.valid th{background:var(--inset); color:var(--muted); font-size:10px; lett
 .dot.now{background:transparent; border:2px solid #fff; width:8px; height:8px; box-shadow:0 0 0 1px #93a5b8}
 .dot.load{background:var(--bad); border:1px solid #fff}
 .btn-row button.secondary{background:var(--panel); color:var(--ink); border-color:var(--line)}
+  .file-btn{display:inline-flex; align-items:center; gap:8px; background:var(--panel); border:1px solid var(--line); border-radius:var(--radius); padding:7px 12px; cursor:pointer; font-size:11.5px; font-weight:700; letter-spacing:.3px; color:var(--ink)}
+  .file-btn:hover{background:var(--inset); border-color:var(--accent)}
+  .file-btn input{display:none}
+  .strip-telemetry{flex:1; min-width:260px; display:flex; gap:10px; align-items:center; flex-wrap:wrap}
+  .telemetry-progress{display:flex; gap:8px; align-items:center; margin-top:4px}
+  .telemetry-progress progress{flex:1; height:6px; accent-color:var(--accent)}
 .worked{font-size:11.5px; background:var(--inset); border:1px dashed var(--line); padding:9px 10px; border-radius:var(--radius); line-height:1.6}
 .factor{margin-bottom:9px}
 .factor label{display:block; font-size:12px; margin-bottom:4px}

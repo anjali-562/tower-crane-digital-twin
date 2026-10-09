@@ -77,6 +77,27 @@ const S = {
   cap: null, util: null, moment: null, corner: null,
 };
 
+// ---------- Telemetry Playback State ----------
+const T = {
+  // CSV data
+  rows: [],                    // TelemetryRow[] sorted by ts
+  rowIndex: 0,                 // next row to apply
+
+  // Clock
+  startWallMs: 0,              // performance.now() when playback started
+  startTsMs: 0,                // Date.parse(rows[0].ts) in ms
+  speed: 1,                    // 0.5, 1, 2, 4, 10, 60, etc.
+  playing: false,              // playback running
+  wasPlayingBeforePause: false,// for resume behavior
+
+  // Mode
+  mode: 'manual',              // 'live' | 'manual'
+
+  // Callbacks for Anjali/Namya integration
+  onRowParsed: null,           // (row, index) => void
+  onInvalidRow: null,          // (row, index, reason) => void
+};
+
 /* ============================================================
    CYCLE 2 — REAL CRANE per Cycle-2 starter kit (STARTER-KIT.md).
    Potain MCT 88 (C25). Physics lives in capacity.js:
@@ -104,6 +125,246 @@ function cornerNow() { return momentNow() / MCT88.maxCapacityT; }
 function pctErr(model, real) { return real > 0 ? Math.abs(model - real) / real * 100 : 0; }
 const MAST_TOP = () => (S.config === 'tall' ? 56 : 48);
 const WIND_AMP = () => (S.wind === 'low' ? 0.15 : S.wind === 'moderate' ? 0.5 : 1.4);
+
+// ---------- Telemetry Playback Functions ----------
+function parseTelemetryCSV(csvText) {
+  const lines = csvText.trim().split('\n');
+  if (lines.length < 2) throw new Error('CSV empty or header only');
+
+  const header = lines[0].split(',').map(h => h.trim());
+  const expected = ['ts','imei','load_t','radius_m','slew_deg','hook_height_m','wind_kmh','moment_pct','status_word','event'];
+  if (!header.every((h,i) => h === expected[i])) {
+    throw new Error('CSV header mismatch: expected ' + expected.join(',') + ' got ' + header.join(','));
+  }
+
+  const rows = [];
+  for (let i = 1; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (!line) continue;
+    const cols = line.split(',');
+    if (cols.length !== 10) {
+      if (T.onInvalidRow) T.onInvalidRow(line, i, 'column count mismatch (expected 10, got ' + cols.length + ')');
+      continue;
+    }
+    const ts = cols[0].trim();
+    const tsMs = Date.parse(ts);
+    if (isNaN(tsMs)) {
+      if (T.onInvalidRow) T.onInvalidRow(line, i, 'invalid timestamp: ' + ts);
+      continue;
+    }
+    const load_t = parseFloat(cols[2]);
+    const radius_m = parseFloat(cols[3]);
+    const slew_deg = parseFloat(cols[4]);
+    const hook_height_m = parseFloat(cols[5]);
+    const wind_kmh = parseFloat(cols[6]);
+    const moment_pct = parseFloat(cols[7]);
+    const status_word = parseInt(cols[8], 10);
+
+    if ([load_t, radius_m, slew_deg, hook_height_m, wind_kmh, moment_pct].some(v => isNaN(v)) || isNaN(status_word)) {
+      if (T.onInvalidRow) T.onInvalidRow(line, i, 'NaN in numeric field');
+      continue;
+    }
+
+    const row = {
+      ts,
+      tsMs,
+      imei: cols[1].trim(),
+      load_t,
+      radius_m,
+      slew_deg,
+      hook_height_m,
+      wind_kmh,
+      moment_pct,
+      status_word,
+      event: cols[9].trim(),
+    };
+    rows.push(row);
+    if (T.onRowParsed) T.onRowParsed(row, rows.length - 1);
+  }
+
+  // Sort by timestamp (defensive; CSV claims to be in order)
+  rows.sort((a, b) => a.tsMs - b.tsMs);
+  return rows;
+}
+
+function applyTelemetryRow(row) {
+  // Clamp to scene bounds (same as manual slider limits)
+  S.tHoist = THREE.MathUtils.clamp(row.hook_height_m, 1.5, MAST_TOP() - 1);
+  S.tTrolley = THREE.MathUtils.clamp(row.radius_m, 2, 53.1);
+  S.tSlew = row.slew_deg;
+  S.load = THREE.MathUtils.clamp(row.load_t, 0, 5);
+  S.windKmh = row.wind_kmh;  // feeds capacityAt() for derate
+
+  // Update slider displays immediately in LIVE mode
+  if (T.mode === 'live') syncSliders();
+
+  // Update UI text immediately
+  updateUI();
+}
+
+function telemetryTick(nowMs) {
+  if (!T.playing || T.rows.length === 0) return;
+
+  // Simulated elapsed time = real elapsed × speed
+  const simElapsedMs = (nowMs - T.startWallMs) * T.speed;
+  const targetTsMs = T.startTsMs + simElapsedMs;
+
+  // Consume all rows whose timestamp ≤ target
+  while (T.rowIndex < T.rows.length && T.rows[T.rowIndex].tsMs <= targetTsMs) {
+    const row = T.rows[T.rowIndex++];
+    applyTelemetryRow(row);
+  }
+
+  // End of dataset
+  if (T.rowIndex >= T.rows.length) {
+    T.playing = false;
+    T.mode = 'manual';  // drop to manual at end
+    updateModeUI();
+    const status = $('telemetryStatus');
+    if (status) status.textContent = '✅ Playback complete — ' + T.rows.length + ' rows processed';
+  }
+}
+
+function pausePlayback() {
+  T.playing = false;
+  T.wasPlayingBeforePause = true;
+}
+
+function resumePlayback() {
+  if (!T.wasPlayingBeforePause) return;
+  const now = performance.now();
+  const simElapsed = (now - T.startWallMs) * T.speed;
+  T.startWallMs = now - simElapsed / T.speed;
+  T.playing = true;
+  T.wasPlayingBeforePause = false;
+}
+
+function resetPlayback() {
+  T.rowIndex = 0;
+  T.playing = false;
+  T.startWallMs = 0;
+  T.startTsMs = 0;
+  if (T.rows.length > 0) {
+    T.startTsMs = T.rows[0].tsMs;
+    // Apply first row immediately to set initial state
+    applyTelemetryRow(T.rows[0]);
+    T.rowIndex = 1;
+  }
+  T.mode = 'manual';
+  updateModeUI();
+}
+
+function setPlaybackSpeed(newSpeed) {
+  if (!T.playing) { T.speed = newSpeed; return; }
+  const now = performance.now();
+  const simElapsed = (now - T.startWallMs) * T.speed;
+  T.speed = newSpeed;
+  T.startWallMs = now - simElapsed / T.speed;
+}
+
+function setMode(newMode) {
+  if (newMode === 'live') {
+    if (T.rows.length === 0) { alert('Load telemetry CSV first'); return; }
+    if (T.mode === 'live') return;
+    T.mode = 'live';
+    T.playing = true;
+    T.startWallMs = performance.now();
+    T.startTsMs = T.rows[0].tsMs;
+    T.rowIndex = 0;
+    $('btnLive').classList.add('active');
+    $('btnManual').classList.remove('active');
+    $('btnAuto').classList.remove('active');
+    $('hdMode').textContent = 'LIVE';
+    $('stOp').textContent = 'LIVE';
+    $('opStep').textContent = 'LIVE TELEMETRY PLAYBACK';
+    $('opDetail').textContent = 'Following tower-telemetry-2026-09-15.csv — drag any slider to switch to MANUAL';
+    S.playing = true;  // ensure crane animation runs
+  } else {
+    T.mode = 'manual';
+    T.playing = false;
+    $('btnManual').classList.add('active');
+    $('btnLive').classList.remove('active');
+    $('hdMode').textContent = 'MANUAL';
+    $('stOp').textContent = 'MANUAL';
+    $('opStep').textContent = 'MANUAL — AWAITING INPUT';
+    $('opDetail').textContent = 'Hoist / Trolley / Slew sliders are live';
+  }
+}
+
+function updateModeUI() {
+  const isLive = T.mode === 'live';
+  $('btnLive').classList.toggle('active', isLive);
+  $('btnManual').classList.toggle('active', !isLive);
+  $('btnAuto').classList.toggle('active', false);
+  $('hdMode').textContent = isLive ? 'LIVE' : 'MANUAL';
+  $('stOp').textContent = isLive ? 'LIVE' : 'MANUAL';
+}
+
+function wireTelemetryLoader() {
+  const input = $('telemetryFile');
+  const status = $('telemetryStatus');
+  const progressDiv = $('telemetryProgress');
+  const progressBar = $('telemetryProg');
+  const progressText = $('telemetryProgText');
+  if (!input || !status) return;
+
+  input.addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    if (!file.name.toLowerCase().endsWith('.csv')) {
+      status.textContent = '❌ Please select a .csv file';
+      return;
+    }
+    status.textContent = '⏳ Loading…';
+    progressDiv.style.display = 'flex';
+    progressBar.value = 0;
+    progressText.textContent = 'Parsing…';
+
+    try {
+      const text = await file.text();
+      progressBar.value = 50;
+      progressText.textContent = 'Parsing rows…';
+
+      T.rows = parseTelemetryCSV(text);
+
+      progressBar.value = 100;
+      progressText.textContent = 'Done';
+
+      if (T.rows.length === 0) throw new Error('No valid rows parsed');
+
+      resetPlayback();  // sets startTsMs, applies row 0
+      status.textContent = '✅ Loaded ' + T.rows.length.toLocaleString() + ' rows (' + T.rows[0].ts + ' → ' + T.rows[T.rows.length-1].ts + ')';
+      $('btnLive').disabled = false;
+
+      setTimeout(() => { progressDiv.style.display = 'none'; }, 1000);
+    } catch (err) {
+      status.textContent = '❌ ' + err.message;
+      progressDiv.style.display = 'none';
+      console.error(err);
+    }
+  });
+}
+
+// Getters for Namya's divergence badge
+function getDeviceMomentPct() {
+  if (T.rowIndex > 0 && T.rowIndex <= T.rows.length) {
+    return T.rows[T.rowIndex - 1].moment_pct;
+  }
+  return null;
+}
+
+function getComputedUtilization() {
+  const cap = capNow(S.trolley);
+  if (cap == null || cap <= 0) return null;
+  return S.load / cap;
+}
+
+// Expose for integration
+window.TelemetryAPI = {
+  getDeviceMomentPct,
+  getComputedUtilization,
+  getTelemetryState: () => ({ mode: T.mode, playing: T.playing, rowIndex: T.rowIndex, totalRows: T.rows.length, speed: T.speed }),
+};
 
 // ---------- Label sprites ----------
 const labelGroup = new THREE.Group(); scene.add(labelGroup);
@@ -424,7 +685,9 @@ function polarFor(pos) {
 function updateCraneMovement(dt) {
   const k = Math.min(1, dt * 2.2 * S.speed);
   if (S.mode === 'manual' || S.autoStep < 0) {
-    S.slew += (S.tSlew - S.slew) * k;
+    // Use shortest-path for slew to handle ±180° wrap (same as runAutomaticLift)
+    let ds = ((S.tSlew - S.slew + 540) % 360) - 180;
+    S.slew += ds * k;
     S.trolley += (S.tTrolley - S.trolley) * k;
     S.hoist += (S.tHoist - S.hoist) * k;
   } else {
@@ -778,12 +1041,16 @@ function resetSimulation() {
   set('plResLoad','—'); set('plResRadius','—'); set('plResHeight','—'); set('plResCap','—'); set('plResUtil','—'); set('plResMoment','—'); set('plResCorner','—'); set('plResMLimit','—'); set('plZoneRow','—'); set('plBldgRow','—');
   const v=$('plVerdict'); if(v){v.className='risk low'; v.textContent='AWAITING CHECK';}
   set('plReason','—'); set('plSafeRadius','—');
+  // Reset telemetry playback state (but keep loaded CSV)
+  resetPlayback();
 }
 
 // ---------- animateCrane ----------
 const clock = new THREE.Clock();
 function animateCrane() {
   requestAnimationFrame(animateCrane);
+  const nowMs = performance.now();
+  telemetryTick(nowMs);
   const dt = Math.min(0.05, clock.getDelta());
   if (S.playing) updateCraneMovement(dt);
   updateCollisionDetection();
@@ -808,8 +1075,9 @@ function syncSliders() {
   $('sHoist').value = S.tHoist; $('sTrolley').value = S.tTrolley; $('sSlew').value = S.tSlew;
 }
 function syncModeButtons() {
-  $('btnManual').classList.toggle('active', S.mode === 'manual');
+  $('btnManual').classList.toggle('active', S.mode === 'manual' && T.mode !== 'live');
   $('btnAuto').classList.toggle('active', S.mode === 'auto');
+  $('btnLive').classList.toggle('active', T.mode === 'live');
 }
 function refreshFloors() {
   const b = buildings[S.target.building]; const sel = $('selFloor'); sel.innerHTML = '';
@@ -822,10 +1090,15 @@ function updateTargetInfo() {
   $('targetInfo').textContent = `BUILDING: ${S.target.building} · FLOOR: ${S.target.floor} · TARGET HEIGHT: Example ${t.height.toFixed(1)} m · Material placement`;
 }
 function wireUI() {
-  $('sHoist').addEventListener('input', e => { S.tHoist = +e.target.value; if (S.mode === 'auto') { S.mode = 'manual'; S.autoStep = -1; syncModeButtons(); } });
-  $('sTrolley').addEventListener('input', e => { S.tTrolley = +e.target.value; if (S.mode === 'auto') { S.mode = 'manual'; S.autoStep = -1; syncModeButtons(); } });
-  $('sSlew').addEventListener('input', e => { S.tSlew = +e.target.value; if (S.mode === 'auto') { S.mode = 'manual'; S.autoStep = -1; syncModeButtons(); } });
-  $('sLoad').addEventListener('input', e => { S.load = +e.target.value; });
+  // Slider interactions — drop out of LIVE mode when user drags
+  function onSliderInput() {
+    if (T.mode === 'live') setMode('manual');
+    if (S.mode === 'auto') { S.mode = 'manual'; S.autoStep = -1; syncModeButtons(); }
+  }
+  $('sHoist').addEventListener('input', e => { S.tHoist = +e.target.value; onSliderInput(); });
+  $('sTrolley').addEventListener('input', e => { S.tTrolley = +e.target.value; onSliderInput(); });
+  $('sSlew').addEventListener('input', e => { S.tSlew = +e.target.value; onSliderInput(); });
+  $('sLoad').addEventListener('input', e => { S.load = +e.target.value; onSliderInput(); });
   $('sJib').addEventListener('input', e => {
     S.jibLen = Math.round(+e.target.value * 10) / 10;
     // NOTE: trolley slider keeps its ABSOLUTE bounds (2–53.1 m). Do not clamp
@@ -871,29 +1144,58 @@ function wireUI() {
     slewGroup.traverse(o => { if (o.isSprite) o.visible = e.target.checked; });
   });
   $('tWind').addEventListener('change', e => windGroup.visible = e.target.checked);
-  $('btnPlay').addEventListener('click', () => S.playing = true);
-  $('btnPause').addEventListener('click', () => S.playing = false);
-  $('btnReset').addEventListener('click', resetSimulation);
-  $('btnManual').addEventListener('click', () => { S.mode = 'manual'; S.autoStep = -1; $('opStep').textContent = 'MANUAL — AWAITING INPUT'; syncModeButtons(); });
+
+  // Transport controls — work for both manual and telemetry playback
+  $('btnPlay').addEventListener('click', () => {
+    if (T.mode === 'live') {
+      resumePlayback();
+    } else {
+      S.playing = true;
+    }
+  });
+  $('btnPause').addEventListener('click', () => {
+    if (T.mode === 'live') {
+      pausePlayback();
+    } else {
+      S.playing = false;
+    }
+  });
+  $('btnReset').addEventListener('click', () => {
+    resetSimulation();
+    resetPlayback();
+  });
+
+  // Mode buttons
+  $('btnManual').addEventListener('click', () => setMode('manual'));
+  $('btnLive').addEventListener('click', () => setMode('live'));
   $('btnAuto').addEventListener('click', startAutoLift);
   $('btnDemoLift').addEventListener('click', startAutoLift);
+
+  // Speed controls — affect both crane animation and telemetry playback
   document.querySelectorAll('.speed-btn').forEach(b => b.addEventListener('click', () => {
-    S.speed = +b.dataset.speed;
+    const newSpeed = +b.dataset.speed;
+    S.speed = newSpeed;
+    setPlaybackSpeed(newSpeed);
     document.querySelectorAll('.speed-btn').forEach(x => x.classList.toggle('active', x === b));
   }));
+
   document.querySelectorAll('[data-cam]').forEach(b => b.addEventListener('click', () => setCam(b.dataset.cam)));
   $('selBuilding').addEventListener('change', e => { S.target.building = e.target.value; refreshFloors(); });
   $('selFloor').addEventListener('change', e => { S.target.floor = +e.target.value; updateTargetInfo(); });
   $('btnGotoFloor').addEventListener('click', () => {
     const t = targetFor(S.target.building, S.target.floor); const p = polarFor(t.pos);
     S.tTrolley = Math.min(p.r, S.jibLen - 1); S.tSlew = p.slew; S.tHoist = t.pos.y + 1.2;
-    S.mode = 'manual'; S.autoStep = -1; syncModeButtons(); syncSliders();
+    setMode('manual');
+    syncModeButtons(); syncSliders();
     $('opStep').textContent = `MANUAL GUIDE → BLDG ${S.target.building} F${S.target.floor}`;
     $('opDetail').textContent = `Target example height ${t.height.toFixed(1)} m. Sliders pre-set — press PLAY if paused.`;
   });
   // Lift Planner — simulation-based engineering check (uses existing capacityAt/hookInZone/buildingClearance)
   const bc = $('btnCheckLift'); if (bc) bc.addEventListener('click', checkLift);
   const bu = $('btnUseAsDemo'); if (bu) bu.addEventListener('click', useAsDemo);
+
+  // Telemetry CSV loader
+  wireTelemetryLoader();
 }
 
 // ---------- Validation table + load-chart canvas (capacityAt vs real points) ----------
