@@ -1078,6 +1078,15 @@ function checkLift() {
   set('plResult', 'Checked load ' + L.toFixed(2) + ' t @ R ' + R.toFixed(1) + ' m, H ' + H.toFixed(1) + ' m · jib ' + S.jibLen + ' m · slew ' + Math.round(S.slew) + '°. Same capacityAt() model as live badge — simulation-based engineering check, NOT a certified lift plan.');
   const sr = safeRadiusFor(L);
   set('plSafeRadius', sr != null ? ('Recommendation: ' + L.toFixed(2) + ' t stays within capacity up to radius ≤ ' + sr.toFixed(1) + ' m (current jib ' + S.jibLen + ' m).' + (capPass ? '' : ' Reduce load OR move trolley closer.')) : 'No safe radius found within the crane envelope.');
+
+  // Auto jib suggestion (shortest installed jib with 15% safety margin)
+  const suggestedJib = suggestJib(MCT88, L, R, S.windKmh);
+  const hint = $('plJibHint'), sj = $('plSuggestedJib');
+  if (hint && sj) {
+    hint.style.display = 'block';
+    sj.textContent = suggestedJib ? fmtJib(suggestedJib) : 'No suitable jib';
+  }
+
   lastChartKey = ''; drawChart();
 }
 function useAsDemo() {

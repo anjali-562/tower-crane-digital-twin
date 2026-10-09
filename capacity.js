@@ -80,6 +80,29 @@ function validate(model, jibM, chart, tolerancePct) {
   return worst;
 }
 
+// Auto jib suggestion — returns shortest installed jib from table that can carry
+// loadT at radiusM with 15% safety margin (loadT <= ratedCapacity * 0.85).
+// Returns jibM (number) or null if no installed jib qualifies.
+function suggestJib(model, loadT, radiusM, windKmh) {
+  if (!model || !Array.isArray(model.tipLoadByJib) || model.tipLoadByJib.length === 0) return null;
+  if (!isFinite(loadT) || loadT <= 0) return null;
+  if (!isFinite(radiusM) || radiusM <= 0) return null;
+
+  var w = windKmh;
+  if (w !== undefined && w !== null && !isFinite(w)) w = undefined;
+
+  var jibs = model.tipLoadByJib.slice().sort(function (a, b) { return a.jibM - b.jibM; });
+
+  for (var i = 0; i < jibs.length; i++) {
+    var jibM = jibs[i].jibM;
+    if (radiusM > jibM) continue;
+    var cap = capacityAt(model, jibM, radiusM, w);
+    if (cap == null) continue;
+    if (loadT <= cap * 0.85) return jibM;
+  }
+  return null;
+}
+
 // Ground-position point-in-rectangle for the exclusion-zone check (STARTER-KIT §6).
 function hookInZone(hookX, hookZ, zone /* {x0,z0,x1,z1} */) {
   return hookX >= Math.min(zone.x0, zone.x1) && hookX <= Math.max(zone.x0, zone.x1)
