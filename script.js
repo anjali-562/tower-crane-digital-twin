@@ -93,7 +93,13 @@ const T = {
   // Mode
   mode: 'manual',              // 'live' | 'manual'
 
-  // Callbacks for Anjali/Namya integration
+  // Validation (Cycle 3 — Anjali)
+  validationStore: null,       // dataset-level results + data-quality counters
+  playbackSession: null,       // applies only OK/WARN rows; REJECT is held
+  lastValidation: null,        // result for the most recently consumed sample
+  lastAppliedRow: null,        // last row that actually reached crane state
+
+  // Callbacks for integration
   onRowParsed: null,           // (row, index) => void
   onInvalidRow: null,          // (row, index, reason) => void
 };
@@ -137,57 +143,52 @@ function parseTelemetryCSV(csvText) {
     throw new Error('CSV header mismatch: expected ' + expected.join(',') + ' got ' + header.join(','));
   }
 
+  if (typeof TelemetryValidation === 'undefined') {
+    throw new Error('telemetry-validation.js did not load — validation module missing');
+  }
+
   const rows = [];
+  const validationStore = TelemetryValidation.createStore();
+
   for (let i = 1; i < lines.length; i++) {
     const line = lines[i].trim();
     if (!line) continue;
     const cols = line.split(',');
-    if (cols.length !== 10) {
-      if (T.onInvalidRow) T.onInvalidRow(line, i, 'column count mismatch (expected 10, got ' + cols.length + ')');
-      continue;
-    }
-    const ts = cols[0].trim();
-    const tsMs = Date.parse(ts);
-    if (isNaN(tsMs)) {
-      if (T.onInvalidRow) T.onInvalidRow(line, i, 'invalid timestamp: ' + ts);
-      continue;
-    }
-    const load_t = parseFloat(cols[2]);
-    const radius_m = parseFloat(cols[3]);
-    const slew_deg = parseFloat(cols[4]);
-    const hook_height_m = parseFloat(cols[5]);
-    const wind_kmh = parseFloat(cols[6]);
-    const moment_pct = parseFloat(cols[7]);
-    const status_word = parseInt(cols[8], 10);
-
-    if ([load_t, radius_m, slew_deg, hook_height_m, wind_kmh, moment_pct].some(v => isNaN(v)) || isNaN(status_word)) {
-      if (T.onInvalidRow) T.onInvalidRow(line, i, 'NaN in numeric field');
-      continue;
+    const lineNo = i + 1;
+    if (cols.length !== 10 && T.onInvalidRow) {
+      T.onInvalidRow(line, i, 'column count mismatch (expected 10, got ' + cols.length + ')');
     }
 
-    const row = {
-      ts,
-      tsMs,
-      imei: cols[1].trim(),
-      load_t,
-      radius_m,
-      slew_deg,
-      hook_height_m,
-      wind_kmh,
-      moment_pct,
-      status_word,
-      event: cols[9].trim(),
-    };
-    rows.push(row);
-    if (T.onRowParsed) T.onRowParsed(row, rows.length - 1);
+    // Preserve every row for validation, including missing/non-numeric fields.
+    // Missing fields become NaN and are rejected; they are never defaulted to 0.
+    const row = TelemetryValidation.parseRow(cols);
+    row.csvLine = lineNo;
+    row.raw = line;
+    row._columnCount = cols.length;
+    const rowId = 'L' + lineNo;
+    const vres = validationStore.handle(row, { rowId: rowId });
+    row.validation = vres;
+    row.tsMs = vres.timestampMs;
+
+    if (T.onRowParsed) T.onRowParsed(row, rows.length);
+
+    // A row with an invalid timestamp cannot be placed on the playback clock.
+    // It is still counted/reported by the validation store.
+    if (isFinite(row.tsMs)) rows.push(row);
   }
 
-  // Sort by timestamp (defensive; CSV claims to be in order)
+  // Sort by timestamp for playback (defensive; CSV claims to be in order).
+  // Validation ran in original device order, so out-of-order/duplicate
+  // timestamps remain attached to their original rows as WARN results.
   rows.sort((a, b) => a.tsMs - b.tsMs);
+  T.validationStore = validationStore;
   return rows;
 }
 
 function applyTelemetryRow(row) {
+  // Defence in depth: a rejected sample must never reach the crane state.
+  if (!row || (row.validation && !row.validation.valid)) return false;
+
   // Clamp to scene bounds (same as manual slider limits)
   S.tHoist = THREE.MathUtils.clamp(row.hook_height_m, 1.5, MAST_TOP() - 1);
   S.tTrolley = THREE.MathUtils.clamp(row.radius_m, 2, 53.1);
@@ -200,6 +201,26 @@ function applyTelemetryRow(row) {
 
   // Update UI text immediately
   updateUI();
+  return true;
+}
+
+function ensurePlaybackSession() {
+  if (T.playbackSession) return T.playbackSession;
+  if (typeof TelemetryValidation === 'undefined') return null;
+  T.playbackSession = TelemetryValidation.createPlaybackSession({
+    onAccept: function (row) {
+      T.lastAppliedRow = row;
+      applyTelemetryRow(row);
+    },
+    onWarn: function (res) { T.lastValidation = res; },
+    onReject: function (res) { T.lastValidation = res; },
+  });
+  return T.playbackSession;
+}
+
+function updateValidationPanel() {
+  if (!T.validationStore || typeof TelemetryValidation === 'undefined') return;
+  TelemetryValidation.renderCounterPanel(T.validationStore, document, T.lastValidation || null);
 }
 
 function telemetryTick(nowMs) {
@@ -209,19 +230,29 @@ function telemetryTick(nowMs) {
   const simElapsedMs = (nowMs - T.startWallMs) * T.speed;
   const targetTsMs = T.startTsMs + simElapsedMs;
 
-  // Consume all rows whose timestamp ≤ target
+  // Consume all rows whose timestamp ≤ target. Rejected rows advance the
+  // row/clock pointer but are never applied to the crane state.
+  const session = ensurePlaybackSession();
+  let consumed = false;
   while (T.rowIndex < T.rows.length && T.rows[T.rowIndex].tsMs <= targetTsMs) {
     const row = T.rows[T.rowIndex++];
-    applyTelemetryRow(row);
+    const res = session ? session.consume(row) : (row.validation || null);
+    T.lastValidation = res;
+    consumed = true;
   }
+  if (consumed) updateValidationPanel();
 
   // End of dataset
   if (T.rowIndex >= T.rows.length) {
     T.playing = false;
     T.mode = 'manual';  // drop to manual at end
     updateModeUI();
+    const counts = T.validationStore ? T.validationStore.getCounts() : null;
     const status = $('telemetryStatus');
-    if (status) status.textContent = '✅ Playback complete — ' + T.rows.length + ' rows processed';
+    if (status) {
+      status.textContent = '✅ Playback complete — ' + T.rows.length + ' playable rows' +
+        (counts ? ' · dataset: ' + counts.accepted + ' accepted, ' + counts.rejected + ' rejected/held, ' + counts.warnings + ' warnings' : '');
+    }
   }
 }
 
@@ -244,14 +275,25 @@ function resetPlayback() {
   T.playing = false;
   T.startWallMs = 0;
   T.startTsMs = 0;
+  T.lastValidation = null;
+  T.lastAppliedRow = null;
+
   if (T.rows.length > 0) {
     T.startTsMs = T.rows[0].tsMs;
-    // Apply first row immediately to set initial state
-    applyTelemetryRow(T.rows[0]);
-    T.rowIndex = 1;
+    // Apply the first ACCEPTED row to set the initial state. Leading rejected
+    // rows are skipped for state purposes but remain counted/diagnosed.
+    const session = ensurePlaybackSession();
+    while (T.rowIndex < T.rows.length) {
+      const row = T.rows[T.rowIndex++];
+      const res = session ? session.consume(row) : (row.validation || null);
+      T.lastValidation = res;
+      if (!res || res.valid) break;
+    }
   }
+
   T.mode = 'manual';
   updateModeUI();
+  updateValidationPanel();
 }
 
 function setPlaybackSpeed(newSpeed) {
@@ -279,6 +321,8 @@ function setMode(newMode) {
     $('opStep').textContent = 'LIVE TELEMETRY PLAYBACK';
     $('opDetail').textContent = 'Following tower-telemetry-2026-09-15.csv — drag any slider to switch to MANUAL';
     S.playing = true;  // ensure crane animation runs
+    T.lastValidation = null;
+    updateValidationPanel();
   } else {
     T.mode = 'manual';
     T.playing = false;
@@ -330,11 +374,15 @@ function wireTelemetryLoader() {
       progressBar.value = 100;
       progressText.textContent = 'Done';
 
-      if (T.rows.length === 0) throw new Error('No valid rows parsed');
+      if (T.rows.length === 0) throw new Error('No playable rows parsed (check timestamps)');
 
-      resetPlayback();  // sets startTsMs, applies row 0
-      status.textContent = '✅ Loaded ' + T.rows.length.toLocaleString() + ' rows (' + T.rows[0].ts + ' → ' + T.rows[T.rows.length-1].ts + ')';
-      $('btnLive').disabled = false;
+      const counts = T.validationStore ? T.validationStore.getCounts() : null;
+      resetPlayback();  // sets startTsMs, applies the first accepted row
+      status.textContent = '✅ Loaded ' + T.rows.length.toLocaleString() + ' playable rows (' +
+        T.rows[0].ts + ' → ' + T.rows[T.rows.length-1].ts + ')' +
+        (counts ? ' · ' + counts.accepted + ' accepted, ' + counts.rejected + ' rejected/held, ' + counts.warnings + ' warnings' : '');
+      $('btnLive').disabled = !(counts && counts.accepted > 0);
+      updateValidationPanel();
 
       setTimeout(() => { progressDiv.style.display = 'none'; }, 1000);
     } catch (err) {
@@ -359,11 +407,24 @@ function getComputedUtilization() {
   return S.load / cap;
 }
 
+function getCurrentTelemetryRow() {
+  if (T.rowIndex > 0 && T.rowIndex <= T.rows.length) {
+    return T.rows[T.rowIndex - 1];
+  }
+  return null;
+}
+
 // Expose for integration
 window.TelemetryAPI = {
   getDeviceMomentPct,
   getComputedUtilization,
+  getCurrentTelemetryRow,
   getTelemetryState: () => ({ mode: T.mode, playing: T.playing, rowIndex: T.rowIndex, totalRows: T.rows.length, speed: T.speed }),
+  getValidationState: () => ({
+    counts: T.validationStore ? T.validationStore.getCounts() : null,
+    last: T.lastValidation,
+    lastAppliedRowId: T.lastAppliedRow ? (T.lastAppliedRow.rowId || T.lastAppliedRow.csvLine || null) : null,
+  }),
 };
 
 // ---------- Label sprites ----------
@@ -935,6 +996,63 @@ function updateUI() {
   const ck = S.jibLen + '|' + S.trolley.toFixed(2) + '|' + S.load.toFixed(2) + '|' + S.risk + '|' + S.windKmh + '|' + (plannerLast ? plannerLast.radius.toFixed(1) + '/' + plannerLast.load.toFixed(1) : '-');
   if (ck !== lastChartKey) { lastChartKey = ck; drawChart(); }
   const slewHint = $('plSlewHint'); if (slewHint) slewHint.textContent = Math.round(S.slew) + '°';
+
+  // Divergence badge (Cycle 3 — Namya): only in LIVE mode with telemetry loaded
+  updateDivergenceBadge();
+}
+
+function updateDivergenceBadge() {
+  const divBlock = $('divergenceBlock');
+  const divDevice = $('divDevice');
+  const divComputed = $('divComputed');
+  const divDiff = $('divDiff');
+  const divBadge = $('divBadge');
+  const divReason = $('divReason');
+  if (!divBlock || !divDevice || !divComputed || !divDiff || !divBadge || !divReason) return;
+
+  // Only show in LIVE mode with telemetry loaded
+  if (T.mode !== 'live' || T.rows.length === 0) {
+    divBlock.style.display = 'none';
+    return;
+  }
+  divBlock.style.display = 'block';
+
+  const row = getCurrentTelemetryRow();
+  if (!row) {
+    divDevice.textContent = '—';
+    divComputed.textContent = '—';
+    divDiff.textContent = '—';
+    divBadge.textContent = 'NO DATA';
+    divBadge.className = 'div-badge div-invalid';
+    divReason.textContent = 'No telemetry row available';
+    return;
+  }
+
+  const config = {
+    jibLen: S.jibLen,
+    windKmh: S.windKmh,
+    thresholdPct: 5  // configurable default: 5 percentage points
+  };
+
+  const result = window.DivergenceAPI.computeDivergence(row, config);
+
+  divDevice.textContent = window.DivergenceAPI.formatPct(result.deviceMomentPct);
+  divComputed.textContent = window.DivergenceAPI.formatPct(result.computedUtilPct);
+  divDiff.textContent = window.DivergenceAPI.formatPct(result.divergencePct);
+
+  if (result.status === 'invalid') {
+    divBadge.textContent = 'UNAVAILABLE';
+    divBadge.className = 'div-badge div-invalid';
+    divReason.textContent = result.reason || 'Invalid or missing data';
+  } else {
+    divBadge.textContent = window.DivergenceAPI.getStatusText(result.status);
+    divBadge.className = 'div-badge ' + window.DivergenceAPI.getStatusClass(result.status);
+    if (result.status === 'divergent') {
+      divReason.textContent = `Difference ${result.divergencePct.toFixed(1)} pp exceeds ${config.thresholdPct} pp threshold`;
+    } else {
+      divReason.textContent = `Values agree within ${config.thresholdPct} pp threshold`;
+    }
+  }
 }
 
 // ---------- runAutomaticLift (uses REAL chart + geometric checks each stage) ----------
@@ -1409,6 +1527,12 @@ function useAsDemo() {
 try {
   if (typeof capacityAt !== 'function' || typeof hookInZone !== 'function' || typeof MCT88 === 'undefined') {
     throw new Error('capacity.js did not load — MCT88/capacityAt/hookInZone missing. Keep capacity.js next to index.html.');
+  }
+  if (typeof TelemetryValidation === 'undefined') {
+    throw new Error('telemetry-validation.js did not load — keep telemetry-validation.js next to index.html.');
+  }
+  if (typeof DivergenceAPI === 'undefined') {
+    throw new Error('divergence.js did not load — keep divergence.js next to index.html.');
   }
   if (!renderer.capabilities) throw new Error('WebGL unavailable');
   createSite();
