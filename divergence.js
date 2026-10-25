@@ -1,10 +1,10 @@
 /* divergence.js — Device vs Computed Utilisation Comparison (Cycle 3)
  *
- * Compares the device-reported moment_pct (load_t * radius_m / 81 * 100)
- * against an independently computed utilisation using capacityAt() which
- * respects corner radius, max capacity, and wind derating.
+ * Compares the actual transmitted device moment_pct against an independently
+ * computed utilisation using capacityAt() which respects corner radius, max
+ * capacity, and wind derating.
  *
- * Exposes: DivergenceAPI.compute(row, config) -> result object
+ * Exposes: DivergenceAPI.computeDivergence(row, config) -> result object
  */
 
 (function () {
@@ -26,17 +26,17 @@ function isValidNumber(v) {
 }
 
 /**
- * Computes the device-reported moment percentage from telemetry row.
- * Formula: load_t * radius_m / 81 * 100
- * @param {Object} row - Telemetry row with load_t, radius_m
- * @returns {number|null} Moment percentage or null if invalid
+ * Gets the device-reported moment percentage as transmitted by the device.
+ * Uses row.moment_pct directly (do NOT recompute from load_t*radius_m/81).
+ * @param {Object} row - Telemetry row
+ * @returns {number|null} Transmitted moment percentage or null if invalid
  */
 function computeDeviceMomentPct(row) {
-  if (!row || !isValidNumber(row.load_t) || !isValidNumber(row.radius_m)) {
+  if (!row) return null;
+  if (!isValidNumber(row.moment_pct)) {
     return null;
   }
-  if (row.radius_m <= 0) return null;
-  return (row.load_t * row.radius_m / REFERENCE_MOMENT) * 100;
+  return row.moment_pct;
 }
 
 /**
@@ -114,6 +114,16 @@ function computeDivergence(row, config) {
     };
   }
   if (!isValidNumber(row.radius_m)) {
+    return {
+      deviceMomentPct: null,
+      computedUtilPct: null,
+      divergencePct: null,
+      isDivergent: false,
+      status: 'invalid',
+      reason: 'Invalid or missing radius_m'
+    };
+  }
+  if (row.radius_m <= 0) {
     return {
       deviceMomentPct: null,
       computedUtilPct: null,

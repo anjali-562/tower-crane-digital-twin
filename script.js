@@ -13,6 +13,101 @@
 (function () {
 'use strict';
 
+// ---------- Telemetry Playback State ----------
+// These limits are SIMULATION HEURISTICS, not manufacturer/certified crane
+// limits. Repository documentation gives position ranges and the one-second
+// cadence but no certified trolley/hoist/slew/load rates, so these values are
+// intentionally configurable and every rejection reason labels them as such.
+const RATE_LIMITS = {
+  radiusMps: 10,
+  hookMps: 10,
+  loadTps: 5,
+  slewDegPerSec: 120
+};
+const STALE_AFTER_MS = 5000;
+
+// Documented DRM 3400 status_word bits (docs/reference/README-for-students.md §3).
+// Only these meanings are used below; no undocumented bit semantics are assumed.
+const STATUS_BITS = {
+  hoist: 0x0001,
+  trolley: 0x0002,
+  slew: 0x0004,
+  utilisation: 0x0008,
+  wind: 0x0040,
+  overload: 0x0080,
+  lsTrolleyOut: 0x0100,
+  lsTrolleyIn: 0x0200,
+  lsHookDown: 0x0400,
+  lsHookUp: 0x0800,
+  testMode: 0x1000
+};
+const WIND_ALERT_THRESHOLD_KMH = 40; // documented kit alert threshold
+const OVERLOAD_IMPLAUSIBLE_MOMENT_PCT = 50; // far below any plausible overload (see check)
+
+const T = {
+  // CSV data
+  rows: [],                    // TelemetryRow[] in original chronological order
+  rowIndex: 0,                 // next row to apply
+  sourceEndTsMs: null,         // latest timestamp present in the source CSV
+
+  // Clock
+  startWallMs: 0,              // performance.now() when playback started
+  startTsMs: 0,                // Date.parse(rows[0].ts) in ms
+  speed: 1,                    // 0.5, 1, 2, 4, 10, 60, etc.
+  playing: false,              // playback running
+  wasPlayingBeforePause: false,// for resume behavior
+
+  // Mode
+  mode: 'manual',              // 'live' | 'manual'
+
+  // Callbacks for Anjali/Namya integration
+  onRowParsed: null,           // (row, index) => void
+  onInvalidRow: null,          // (row, index, reason) => void
+
+  // Validation/state tracking
+  lastAcceptedRow: null,
+  lastAcceptedIndex: -1,
+  lastAcceptedTsMs: null,
+  lastWallMsSeen: 0,
+  stale: false,
+  staleSince: 0,
+  complete: false,
+  acceptedCount: 0,
+  rejectedCount: 0,
+  lastRejectionReason: '',
+  rejectionReasons: Object.create(null)
+};
+
+// Pure telemetry helpers are exposed before the THREE guard so they can be
+// tested headlessly (node tests/verify-telemetry.js) without WebGL/DOM APIs.
+window.TelemetryAPI = {
+  parseTelemetryCSV,
+  validateTelemetryRow,
+  computeResumePosition,
+  isTelemetryStale,
+  isTelemetryComplete,
+  formatRejectionSummary,
+  getCurrentTelemetryRow,
+  getTelemetryState: () => ({
+    mode: T.mode,
+    playing: T.playing,
+    complete: T.complete,
+    stale: T.stale,
+    rowIndex: T.rowIndex,
+    totalRows: T.rows.length,
+    sourceEndTsMs: T.sourceEndTsMs,
+    lastAcceptedIndex: T.lastAcceptedIndex,
+    lastAcceptedTsMs: T.lastAcceptedTsMs,
+    acceptedCount: T.acceptedCount,
+    rejectedCount: T.rejectedCount,
+    lastRejectionReason: T.lastRejectionReason,
+    rejectionReasons: Object.assign({}, T.rejectionReasons),
+    speed: T.speed
+  }),
+  rateLimits: RATE_LIMITS,
+  staleAfterMs: STALE_AFTER_MS
+};
+
 // Surface errors visibly (helps when CDN is blocked / offline)
 function showGlError(msg) {
   const el = document.getElementById('glError');
@@ -77,27 +172,6 @@ const S = {
   cap: null, util: null, moment: null, corner: null,
 };
 
-// ---------- Telemetry Playback State ----------
-const T = {
-  // CSV data
-  rows: [],                    // TelemetryRow[] sorted by ts
-  rowIndex: 0,                 // next row to apply
-
-  // Clock
-  startWallMs: 0,              // performance.now() when playback started
-  startTsMs: 0,                // Date.parse(rows[0].ts) in ms
-  speed: 1,                    // 0.5, 1, 2, 4, 10, 60, etc.
-  playing: false,              // playback running
-  wasPlayingBeforePause: false,// for resume behavior
-
-  // Mode
-  mode: 'manual',              // 'live' | 'manual'
-
-  // Callbacks for Anjali/Namya integration
-  onRowParsed: null,           // (row, index) => void
-  onInvalidRow: null,          // (row, index, reason) => void
-};
-
 /* ============================================================
    CYCLE 2 — REAL CRANE per Cycle-2 starter kit (STARTER-KIT.md).
    Potain MCT 88 (C25). Physics lives in capacity.js:
@@ -127,8 +201,141 @@ const MAST_TOP = () => (S.config === 'tall' ? 56 : 48);
 const WIND_AMP = () => (S.wind === 'low' ? 0.15 : S.wind === 'moderate' ? 0.5 : 1.4);
 
 // ---------- Telemetry Playback Functions ----------
+function validateTelemetryRow(row, index, prevRow) {
+  if (!row) return { valid: false, reason: 'No row' };
+
+  // Basic ranges (documented/physical sanity for this dataset)
+  if (!isFinite(row.load_t) || row.load_t < 0 || row.load_t > 10) {
+    return { valid: false, reason: 'Implausible load_t (out of range)' };
+  }
+  if (!isFinite(row.radius_m) || row.radius_m < 0 || row.radius_m > 60) {
+    return { valid: false, reason: 'Implausible radius_m (out of range)' };
+  }
+  if (!isFinite(row.hook_height_m) || row.hook_height_m < 0 || row.hook_height_m > 60) {
+    return { valid: false, reason: 'Implausible hook_height_m (out of range)' };
+  }
+  if (!isFinite(row.slew_deg) || row.slew_deg < -360 || row.slew_deg > 360) {
+    return { valid: false, reason: 'Implausible slew_deg (out of range)' };
+  }
+  if (!isFinite(row.wind_kmh) || row.wind_kmh < 0 || row.wind_kmh > 200) {
+    return { valid: false, reason: 'Implausible wind_kmh (out of range)' };
+  }
+  if (!isFinite(row.moment_pct) || row.moment_pct < 0 || row.moment_pct > 200) {
+    return { valid: false, reason: 'Implausible moment_pct (out of range)' };
+  }
+  if (!isFinite(row.status_word)) {
+    return { valid: false, reason: 'Invalid status_word' };
+  }
+
+  // Timestamp order: do NOT silently sort the whole dataset to "fix" chronology.
+  // Any row that goes backwards is rejected and reported; duplicate timestamps
+  // are detected separately by the parser.
+  if (prevRow && isFinite(prevRow.tsMs) && isFinite(row.tsMs)) {
+    if (row.tsMs < prevRow.tsMs) {
+      return { valid: false, reason: 'Backwards timestamp jump (out of chronological order)' };
+    }
+    // Implausible rate-of-change: these are SIMULATION HEURISTICS only (not certified
+    // limits). They are labeled as heuristics; if no docs support them, we don't
+    // call them "documented/certified" - see RATE_LIMITS comment.
+    const dtS = Math.max(0.001, (row.tsMs - prevRow.tsMs) / 1000);
+    const dr = Math.abs(row.radius_m - prevRow.radius_m);
+    const dh = Math.abs(row.hook_height_m - prevRow.hook_height_m);
+    const dl = Math.abs(row.load_t - prevRow.load_t);
+    const dslew = Math.abs(((row.slew_deg - prevRow.slew_deg + 540) % 360) - 180);
+    if (dr / dtS > RATE_LIMITS.radiusMps) {
+      return { valid: false, reason: 'Implausible radius rate-of-change (heuristic limit)' };
+    }
+    if (dh / dtS > RATE_LIMITS.hookMps) {
+      return { valid: false, reason: 'Implausible hook height rate-of-change (heuristic limit)' };
+    }
+    if (dl / dtS > RATE_LIMITS.loadTps) {
+      return { valid: false, reason: 'Implausible load rate-of-change (heuristic limit)' };
+    }
+    if (dslew / dtS > RATE_LIMITS.slewDegPerSec) {
+      return { valid: false, reason: 'Implausible slew rate-of-change (heuristic limit)' };
+    }
+  }
+
+  // Cross-channel validation using ONLY documented DRM 3400 bits from docs/reference/README-for-students.md
+  const sw = row.status_word >>> 0;
+  const overloadBit = (sw & STATUS_BITS.overload) !== 0;
+  const windBit = (sw & STATUS_BITS.wind) !== 0;
+
+  // Wind alert bit (0x0040) is documented for this kit as "wind alert active";
+  // alert threshold in docs is 40 km/h. If bit set but wind < 40 km/h, it is a
+  // documented-bit cross-channel contradiction - report as explicit warning reason
+  // but only reject in extreme impossible cases; prefer validation warning/rejection reason.
+  if (windBit && isFinite(row.wind_kmh) && row.wind_kmh < WIND_ALERT_THRESHOLD_KMH - 5) {
+    // Contradiction relative to documented threshold; do not invent other meanings
+    return { valid: false, reason: 'Cross-channel contradiction: wind alert bit set but wind_kmh < 35 km/h (documented threshold 40 km/h)' };
+  }
+
+  // Overload bit (0x0080): if set with implausibly low moment/load, treat as contradiction
+  // only when clearly unsupported by transmitted values; report explicitly.
+  if (overloadBit && isFinite(row.moment_pct) && row.moment_pct < OVERLOAD_IMPLAUSIBLE_MOMENT_PCT &&
+      isFinite(row.load_t) && row.load_t < 1.0) {
+    return { valid: false, reason: 'Cross-channel contradiction: overload bit set but moment_pct/load_t implausibly low (documented bits only)' };
+  }
+
+  // Utilisation bit (0x0008): documented as set from ~90% - only flag if wildly inconsistent
+  // and clearly contradictory; don't reject unless extreme impossible combination.
+  // (Documentation doesn't give full certified rules, so we don't invent broad validation.)
+
+  return { valid: true, reason: '' };
+}
+
+function computeResumePosition(rows, lastAcceptedTsMs, lastAcceptedIndex) {
+  if (!Array.isArray(rows) || rows.length === 0) {
+    return { rowIndex: 0, startTsMs: 0 };
+  }
+  if (lastAcceptedTsMs == null || !isFinite(lastAcceptedTsMs)) {
+    return { rowIndex: 0, startTsMs: rows[0].tsMs };
+  }
+  // Resume at/after last accepted - do not restart at row 0 or replay older rows
+  // Find first row with tsMs > last accepted timestamp; if none, stay at end (complete/stale)
+  let idx = -1;
+  for (let i = 0; i < rows.length; i++) {
+    if (rows[i].tsMs > lastAcceptedTsMs) { idx = i; break; }
+  }
+  if (idx === -1) {
+    // All rows at or before last accepted; don't restart at 0
+    const lastIdx = (lastAcceptedIndex >= 0 && lastAcceptedIndex < rows.length) ? lastAcceptedIndex : rows.length - 1;
+    return { rowIndex: lastIdx, startTsMs: lastAcceptedTsMs, atEnd: true };
+  }
+  return { rowIndex: idx, startTsMs: lastAcceptedTsMs };
+}
+
+function isTelemetryStale(Tstate, nowMs) {
+  if (!Tstate) return true;
+  if (Tstate.mode !== 'live') return Tstate.rows && Tstate.rows.length === 0;
+  if (!Tstate.playing) return true;
+  if (!Tstate.rows || Tstate.rows.length === 0) return true;
+  if (Tstate.complete) return true;
+  if (Tstate.lastAcceptedTsMs == null) return true;
+  return (nowMs - Tstate.lastAcceptedTsMs > STALE_AFTER_MS);
+}
+
+function isTelemetryComplete(Tstate) {
+  if (!Tstate) return false;
+  return !!Tstate.complete;
+}
+
+function formatRejectionSummary(Tstate) {
+  if (!Tstate) return '';
+  const total = (Tstate.acceptedCount || 0) + (Tstate.rejectedCount || 0);
+  return `accepted ${Tstate.acceptedCount || 0}/${total}, rejected ${Tstate.rejectedCount || 0}`;
+}
+
+function recordRejection(reason, rawRow, line, detail) {
+  if (typeof T === 'undefined') return;
+  T.rejectedCount++;
+  T.lastRejectionReason = reason;
+  if (T.rejectionReasons) T.rejectionReasons[reason] = (T.rejectionReasons[reason] || 0) + 1;
+  if (T.onInvalidRow) T.onInvalidRow(rawRow, line, detail || reason);
+}
+
 function parseTelemetryCSV(csvText) {
-  const lines = csvText.trim().split('\n');
+  const lines = String(csvText).trim().split(/\r?\n/);
   if (lines.length < 2) throw new Error('CSV empty or header only');
 
   const header = lines[0].split(',').map(h => h.trim());
@@ -137,19 +344,20 @@ function parseTelemetryCSV(csvText) {
     throw new Error('CSV header mismatch: expected ' + expected.join(',') + ' got ' + header.join(','));
   }
 
-  const rows = [];
+  const allParsed = [];
   for (let i = 1; i < lines.length; i++) {
     const line = lines[i].trim();
     if (!line) continue;
     const cols = line.split(',');
     if (cols.length !== 10) {
-      if (T.onInvalidRow) T.onInvalidRow(line, i, 'column count mismatch (expected 10, got ' + cols.length + ')');
+      recordRejection('column count mismatch', line, i,
+        'column count mismatch (expected 10, got ' + cols.length + ')');
       continue;
     }
     const ts = cols[0].trim();
     const tsMs = Date.parse(ts);
     if (isNaN(tsMs)) {
-      if (T.onInvalidRow) T.onInvalidRow(line, i, 'invalid timestamp: ' + ts);
+      recordRejection('invalid timestamp', line, i, 'invalid timestamp: ' + ts);
       continue;
     }
     const load_t = parseFloat(cols[2]);
@@ -161,7 +369,7 @@ function parseTelemetryCSV(csvText) {
     const status_word = parseInt(cols[8], 10);
 
     if ([load_t, radius_m, slew_deg, hook_height_m, wind_kmh, moment_pct].some(v => isNaN(v)) || isNaN(status_word)) {
-      if (T.onInvalidRow) T.onInvalidRow(line, i, 'NaN in numeric field');
+      recordRejection('NaN in numeric field', line, i);
       continue;
     }
 
@@ -177,51 +385,133 @@ function parseTelemetryCSV(csvText) {
       moment_pct,
       status_word,
       event: cols[9].trim(),
+      _line: i + 1
     };
-    rows.push(row);
-    if (T.onRowParsed) T.onRowParsed(row, rows.length - 1);
+    allParsed.push(row);
   }
 
-  // Sort by timestamp (defensive; CSV claims to be in order)
-  rows.sort((a, b) => a.tsMs - b.tsMs);
+  // Do NOT silently sort to hide chronology issues. Keep source order as presented
+  // and reject any row that moves backwards. Accepted rows therefore always keep
+  // strictly increasing timestamps in the same order as the source file.
+  const rows = [];
+  const seenTs = new Set();
+  let lastSourceTsMs = null;
+  for (let i = 0; i < allParsed.length; i++) {
+    const r = allParsed[i];
+    const duplicate = seenTs.has(r.tsMs);
+    const backwards = lastSourceTsMs != null && r.tsMs < lastSourceTsMs;
+    seenTs.add(r.tsMs);
+    if (duplicate && backwards) {
+      recordRejection('Duplicate timestamp and backwards timestamp jump (out of chronological order)', r, r._line || i + 1);
+      continue;
+    }
+    if (duplicate) {
+      recordRejection('Duplicate timestamp', r, r._line || i + 1);
+      continue;
+    }
+    if (backwards) {
+      recordRejection('Backwards timestamp jump (out of chronological order)', r, r._line || i + 1);
+      continue;
+    }
+    lastSourceTsMs = r.tsMs;
+
+    const prev = rows.length > 0 ? rows[rows.length - 1] : null;
+    const v = validateTelemetryRow(r, i, prev);
+    if (!v.valid) {
+      recordRejection(v.reason, r, r._line || i + 1);
+      continue;
+    }
+    rows.push(r);
+    if (typeof T !== 'undefined') {
+      T.acceptedCount++;
+    }
+    if (typeof T !== 'undefined' && T.onRowParsed) T.onRowParsed(r, rows.length - 1);
+  }
+
+  if (typeof T !== 'undefined') {
+    let sourceEndTsMs = null;
+    for (let i = 0; i < allParsed.length; i++) {
+      if (sourceEndTsMs === null || allParsed[i].tsMs > sourceEndTsMs) sourceEndTsMs = allParsed[i].tsMs;
+    }
+    T.sourceEndTsMs = sourceEndTsMs;
+  }
   return rows;
 }
 
 function applyTelemetryRow(row) {
+  if (!row) return;
   // Clamp to scene bounds (same as manual slider limits)
-  S.tHoist = THREE.MathUtils.clamp(row.hook_height_m, 1.5, MAST_TOP() - 1);
-  S.tTrolley = THREE.MathUtils.clamp(row.radius_m, 2, 53.1);
+  if (typeof THREE !== 'undefined' && THREE.MathUtils) {
+    S.tHoist = THREE.MathUtils.clamp(row.hook_height_m, 1.5, MAST_TOP() - 1);
+    S.tTrolley = THREE.MathUtils.clamp(row.radius_m, 2, 53.1);
+  } else {
+    S.tHoist = Math.max(1.5, Math.min(row.hook_height_m, MAST_TOP() - 1));
+    S.tTrolley = Math.max(2, Math.min(row.radius_m, 53.1));
+  }
   S.tSlew = row.slew_deg;
-  S.load = THREE.MathUtils.clamp(row.load_t, 0, 5);
+  S.load = Math.max(0, Math.min(row.load_t, 5));
   S.windKmh = row.wind_kmh;  // feeds capacityAt() for derate
 
+  // Track last accepted row for stale/divergence logic
+  T.lastAcceptedRow = row;
+  T.lastAcceptedIndex = T.rowIndex - 1 >= 0 ? T.rowIndex - 1 : (T.lastAcceptedIndex >= 0 ? T.lastAcceptedIndex : 0);
+  T.lastAcceptedTsMs = row.tsMs;
+  T.stale = false;
+  if (T.staleSince !== 0) T.staleSince = 0;
+  if (T.complete) T.complete = false;
+
   // Update slider displays immediately in LIVE mode
-  if (T.mode === 'live') syncSliders();
+  if (typeof syncSliders === 'function' && T.mode === 'live') syncSliders();
 
   // Update UI text immediately
-  updateUI();
+  if (typeof updateUI === 'function') updateUI();
 }
 
 function telemetryTick(nowMs) {
-  if (!T.playing || T.rows.length === 0) return;
+  T.lastWallMsSeen = nowMs;
+  if (T.mode !== 'live') {
+    // If we were in live and lost data stream, mark stale (do not flood UI)
+    if (T.rows.length === 0) {
+      T.stale = true;
+      if (T.staleSince === 0) T.staleSince = nowMs;
+    }
+    return;
+  }
+  if (!T.playing || T.rows.length === 0) {
+    T.stale = true;
+    if (T.staleSince === 0) T.staleSince = nowMs;
+    return;
+  }
 
   // Simulated elapsed time = real elapsed × speed
   const simElapsedMs = (nowMs - T.startWallMs) * T.speed;
   const targetTsMs = T.startTsMs + simElapsedMs;
 
-  // Consume all rows whose timestamp ≤ target
+  // Consume all rows whose timestamp ≤ target (do not reorder dataset)
   while (T.rowIndex < T.rows.length && T.rows[T.rowIndex].tsMs <= targetTsMs) {
     const row = T.rows[T.rowIndex++];
     applyTelemetryRow(row);
   }
 
-  // End of dataset
+  // If no new rows consumed recently and playing but no updates, treat as stale
+  if (T.lastAcceptedTsMs && (targetTsMs - T.lastAcceptedTsMs) > STALE_AFTER_MS) {
+    T.stale = true;
+    if (T.staleSince === 0) T.staleSince = nowMs;
+  } else if (T.lastAcceptedTsMs) {
+    T.stale = false;
+    if (T.staleSince !== 0) T.staleSince = 0;
+  }
+
+  // End of dataset - distinct from telemetry loss
   if (T.rowIndex >= T.rows.length) {
     T.playing = false;
-    T.mode = 'manual';  // drop to manual at end
-    updateModeUI();
-    const status = $('telemetryStatus');
-    if (status) status.textContent = '✅ Playback complete — ' + T.rows.length + ' rows processed';
+    T.complete = true;
+    // Clear stale flag in the sense of "loss" - mark as complete/stale distinct state
+    T.stale = true;
+    if (T.staleSince === 0) T.staleSince = nowMs;
+    if (typeof updateModeUI === 'function') updateModeUI();
+    const status = typeof $ === 'function' ? $('telemetryStatus') : null;
+    if (status) status.textContent = 'STALE — Playback complete — ' + T.rows.length + ' rows processed (last accepted sample held)';
   }
 }
 
@@ -244,14 +534,21 @@ function resetPlayback() {
   T.playing = false;
   T.startWallMs = 0;
   T.startTsMs = 0;
+  T.stale = false;
+  T.staleSince = 0;
+  T.complete = false;
   if (T.rows.length > 0) {
     T.startTsMs = T.rows[0].tsMs;
     // Apply first row immediately to set initial state
     applyTelemetryRow(T.rows[0]);
     T.rowIndex = 1;
+  } else {
+    T.lastAcceptedRow = null;
+    T.lastAcceptedIndex = -1;
+    T.lastAcceptedTsMs = null;
   }
   T.mode = 'manual';
-  updateModeUI();
+  if (typeof updateModeUI === 'function') updateModeUI();
 }
 
 function setPlaybackSpeed(newSpeed) {
@@ -264,21 +561,62 @@ function setPlaybackSpeed(newSpeed) {
 
 function setMode(newMode) {
   if (newMode === 'live') {
-    if (T.rows.length === 0) { alert('Load telemetry CSV first'); return; }
-    if (T.mode === 'live') return;
+    if (T.rows.length === 0) { if (typeof alert === 'function') alert('Load telemetry CSV first'); return; }
+    const wasManual = T.mode === 'manual';
     T.mode = 'live';
     T.playing = true;
-    T.startWallMs = performance.now();
-    T.startTsMs = T.rows[0].tsMs;
-    T.rowIndex = 0;
-    $('btnLive').classList.add('active');
-    $('btnManual').classList.remove('active');
-    $('btnAuto').classList.remove('active');
-    $('hdMode').textContent = 'LIVE';
-    $('stOp').textContent = 'LIVE';
-    $('opStep').textContent = 'LIVE TELEMETRY PLAYBACK';
-    $('opDetail').textContent = 'Following tower-telemetry-2026-09-15.csv — drag any slider to switch to MANUAL';
+    const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
+    T.startWallMs = now;
+    T.complete = false;
+    // Rejoin LIVE after MANUAL using reliable last-accepted position/timestamp.
+    // Do NOT restart at row 0 or replay older rows.
+    if (wasManual && T.rows.length > 0) {
+      const resume = computeResumePosition(T.rows, T.lastAcceptedTsMs, T.lastAcceptedIndex);
+      if (resume.atEnd) {
+        // At or past end of loaded stream - stay in live but mark complete/stale distinctly
+        T.startTsMs = T.lastAcceptedTsMs != null ? T.lastAcceptedTsMs : T.rows[T.rows.length - 1].tsMs;
+        T.rowIndex = Math.min(resume.rowIndex, T.rows.length - 1);
+        T.playing = false;
+        T.complete = true;
+        T.stale = true;
+        if (T.staleSince === 0) T.staleSince = now;
+      } else {
+        T.startTsMs = resume.startTsMs;
+        T.rowIndex = resume.rowIndex;
+        // Do not rewind - keep current applied state, continue forward from resume position
+      }
+    } else if (T.rows.length > 0) {
+      // Fresh start of live playback from beginning only if no last accepted position
+      if (T.lastAcceptedTsMs == null) {
+        T.startTsMs = T.rows[0].tsMs;
+        T.rowIndex = 0;
+      } else {
+        const resume = computeResumePosition(T.rows, T.lastAcceptedTsMs, T.lastAcceptedIndex);
+        if (resume.atEnd) {
+          T.startTsMs = T.lastAcceptedTsMs;
+          T.rowIndex = Math.min(resume.rowIndex, T.rows.length - 1);
+          T.playing = false;
+          T.complete = true;
+          T.stale = true;
+          if (T.staleSince === 0) T.staleSince = now;
+        } else {
+          T.startTsMs = resume.startTsMs;
+          T.rowIndex = resume.rowIndex;
+        }
+      }
+    }
+    if (typeof $ === 'function') {
+      $('btnLive').classList.add('active');
+      $('btnManual').classList.remove('active');
+      $('btnAuto').classList.remove('active');
+      $('hdMode').textContent = 'LIVE';
+      $('stOp').textContent = 'LIVE';
+      $('opStep').textContent = 'LIVE TELEMETRY PLAYBACK';
+      $('opDetail').textContent = 'Following tower-telemetry-2026-09-15.csv — drag any slider to switch to MANUAL';
+    }
     S.playing = true;  // ensure crane animation runs
+    T.stale = false;
+    if (T.staleSince !== 0) T.staleSince = 0;
   } else {
     T.mode = 'manual';
     T.playing = false;
@@ -301,45 +639,57 @@ function updateModeUI() {
 }
 
 function wireTelemetryLoader() {
-  const input = $('telemetryFile');
-  const status = $('telemetryStatus');
-  const progressDiv = $('telemetryProgress');
-  const progressBar = $('telemetryProg');
-  const progressText = $('telemetryProgText');
+  const input = typeof $ === 'function' ? $('telemetryFile') : null;
+  const status = typeof $ === 'function' ? $('telemetryStatus') : null;
+  const progressDiv = typeof $ === 'function' ? $('telemetryProgress') : null;
+  const progressBar = typeof $ === 'function' ? $('telemetryProg') : null;
+  const progressText = typeof $ === 'function' ? $('telemetryProgText') : null;
   if (!input || !status) return;
 
   input.addEventListener('change', async (e) => {
-    const file = e.target.files[0];
+    const file = e.target.files && e.target.files[0];
     if (!file) return;
     if (!file.name.toLowerCase().endsWith('.csv')) {
       status.textContent = '❌ Please select a .csv file';
       return;
     }
     status.textContent = '⏳ Loading…';
-    progressDiv.style.display = 'flex';
-    progressBar.value = 0;
-    progressText.textContent = 'Parsing…';
+    if (progressDiv) { progressDiv.style.display = 'flex'; }
+    if (progressBar) progressBar.value = 0;
+    if (progressText) progressText.textContent = 'Parsing…';
 
     try {
       const text = await file.text();
-      progressBar.value = 50;
-      progressText.textContent = 'Parsing rows…';
+      if (progressBar) progressBar.value = 50;
+      if (progressText) progressText.textContent = 'Parsing rows…';
+
+      // Reset counters
+      T.acceptedCount = 0;
+      T.rejectedCount = 0;
+      T.lastRejectionReason = '';
+      T.rejectionReasons = Object.create(null);
+      T.lastAcceptedRow = null;
+      T.lastAcceptedIndex = -1;
+      T.lastAcceptedTsMs = null;
+      T.complete = false;
 
       T.rows = parseTelemetryCSV(text);
 
-      progressBar.value = 100;
-      progressText.textContent = 'Done';
+      if (progressBar) progressBar.value = 100;
+      if (progressText) progressText.textContent = 'Done';
 
       if (T.rows.length === 0) throw new Error('No valid rows parsed');
 
       resetPlayback();  // sets startTsMs, applies row 0
-      status.textContent = '✅ Loaded ' + T.rows.length.toLocaleString() + ' rows (' + T.rows[0].ts + ' → ' + T.rows[T.rows.length-1].ts + ')';
-      $('btnLive').disabled = false;
+      const summary = formatRejectionSummary(T);
+      status.textContent = '✅ Loaded ' + T.rows.length.toLocaleString() + ' rows (' + (T.rows[0].ts || '') + ' → ' + (T.rows[T.rows.length-1].ts || '') + ') — ' + summary + (T.rejectedCount > 0 ? ' (see console/reasons)' : '');
+      const btnLive = typeof $ === 'function' ? $('btnLive') : null;
+      if (btnLive) btnLive.disabled = false;
 
-      setTimeout(() => { progressDiv.style.display = 'none'; }, 1000);
+      if (progressDiv) setTimeout(() => { progressDiv.style.display = 'none'; }, 1000);
     } catch (err) {
       status.textContent = '❌ ' + err.message;
-      progressDiv.style.display = 'none';
+      if (progressDiv) progressDiv.style.display = 'none';
       console.error(err);
     }
   });
@@ -347,8 +697,9 @@ function wireTelemetryLoader() {
 
 // Getters for Namya's divergence badge
 function getDeviceMomentPct() {
-  if (T.rowIndex > 0 && T.rowIndex <= T.rows.length) {
-    return T.rows[T.rowIndex - 1].moment_pct;
+  const row = getCurrentTelemetryRow();
+  if (row && typeof row.moment_pct === 'number' && isFinite(row.moment_pct)) {
+    return row.moment_pct;
   }
   return null;
 }
@@ -356,23 +707,29 @@ function getDeviceMomentPct() {
 function getComputedUtilization() {
   const cap = capNow(S.trolley);
   if (cap == null || cap <= 0) return null;
-  return S.load / cap;
+  return (S.load / cap) * 100;
 }
 
-function getCurrentTelemetryRow() {
-  if (T.rowIndex > 0 && T.rowIndex <= T.rows.length) {
-    return T.rows[T.rowIndex - 1];
+function getCurrentTelemetryRow(Tstate) {
+  const state = Tstate || T;
+  if (!state) return null;
+  // Use last accepted/held telemetry sample (not a rejected incoming row)
+  if (state.lastAcceptedRow) {
+    return state.lastAcceptedRow;
+  }
+  if (state.rows && state.rowIndex > 0 && state.rowIndex <= state.rows.length) {
+    return state.rows[state.rowIndex - 1];
   }
   return null;
 }
 
-// Expose for integration
-window.TelemetryAPI = {
-  getDeviceMomentPct,
-  getComputedUtilization,
-  getCurrentTelemetryRow,
-  getTelemetryState: () => ({ mode: T.mode, playing: T.playing, rowIndex: T.rowIndex, totalRows: T.rows.length, speed: T.speed }),
-};
+// Keep TelemetryAPI definitions (also set earlier before THREE guard)
+// Extend if already exists
+if (typeof window !== 'undefined') {
+  if (!window.TelemetryAPI) window.TelemetryAPI = {};
+  window.TelemetryAPI.getDeviceMomentPct = getDeviceMomentPct;
+  window.TelemetryAPI.getComputedUtilization = getComputedUtilization;
+}
 
 // ---------- Label sprites ----------
 const labelGroup = new THREE.Group(); scene.add(labelGroup);
@@ -949,6 +1306,7 @@ function updateUI() {
 }
 
 function updateDivergenceBadge() {
+  if (typeof $ !== 'function') return;
   const divBlock = $('divergenceBlock');
   const divDevice = $('divDevice');
   const divComputed = $('divComputed');
@@ -958,20 +1316,20 @@ function updateDivergenceBadge() {
   if (!divBlock || !divDevice || !divComputed || !divDiff || !divBadge || !divReason) return;
 
   // Only show in LIVE mode with telemetry loaded
-  if (T.mode !== 'live' || T.rows.length === 0) {
+  if (T.mode !== 'live' || (T.rows.length === 0 && !T.lastAcceptedRow)) {
     divBlock.style.display = 'none';
     return;
   }
   divBlock.style.display = 'block';
 
   const row = getCurrentTelemetryRow();
-  if (!row) {
+  if (!row || (T.stale && !T.lastAcceptedRow)) {
     divDevice.textContent = '—';
     divComputed.textContent = '—';
     divDiff.textContent = '—';
-    divBadge.textContent = 'NO DATA';
+    divBadge.textContent = T.complete ? 'COMPLETE' : 'STALE';
     divBadge.className = 'div-badge div-invalid';
-    divReason.textContent = 'No telemetry row available';
+    divReason.textContent = T.complete ? 'Playback complete — holding last accepted sample' : 'Telemetry missing or lost — holding last accepted sample';
     return;
   }
 
@@ -981,23 +1339,33 @@ function updateDivergenceBadge() {
     thresholdPct: 5  // configurable default: 5 percentage points
   };
 
-  const result = window.DivergenceAPI.computeDivergence(row, config);
-
-  divDevice.textContent = window.DivergenceAPI.formatPct(result.deviceMomentPct);
-  divComputed.textContent = window.DivergenceAPI.formatPct(result.computedUtilPct);
-  divDiff.textContent = window.DivergenceAPI.formatPct(result.divergencePct);
-
-  if (result.status === 'invalid') {
+  if (!window.DivergenceAPI || typeof window.DivergenceAPI.computeDivergence !== 'function') {
+    divDevice.textContent = '—';
+    divComputed.textContent = '—';
+    divDiff.textContent = '—';
     divBadge.textContent = 'UNAVAILABLE';
     divBadge.className = 'div-badge div-invalid';
-    divReason.textContent = result.reason || 'Invalid or missing data';
+    divReason.textContent = 'DivergenceAPI not loaded';
+    return;
+  }
+
+  const result = window.DivergenceAPI.computeDivergence(row, config);
+
+  divDevice.textContent = window.DivergenceAPI.formatPct ? window.DivergenceAPI.formatPct(result.deviceMomentPct) : (result.deviceMomentPct == null ? '—' : result.deviceMomentPct.toFixed(1) + '%');
+  divComputed.textContent = window.DivergenceAPI.formatPct ? window.DivergenceAPI.formatPct(result.computedUtilPct) : (result.computedUtilPct == null ? '—' : result.computedUtilPct.toFixed(1) + '%');
+  divDiff.textContent = window.DivergenceAPI.formatPct ? window.DivergenceAPI.formatPct(result.divergencePct) : (result.divergencePct == null ? '—' : result.divergencePct.toFixed(1) + '%');
+
+  if (result.status === 'invalid') {
+    divBadge.textContent = T.complete ? 'COMPLETE' : (T.stale ? 'STALE' : 'UNAVAILABLE');
+    divBadge.className = 'div-badge div-invalid';
+    divReason.textContent = T.complete ? 'Playback complete — holding last accepted sample' : (T.stale ? 'Telemetry missing or lost — holding last accepted sample' : (result.reason || 'Invalid or missing data'));
   } else {
-    divBadge.textContent = window.DivergenceAPI.getStatusText(result.status);
-    divBadge.className = 'div-badge ' + window.DivergenceAPI.getStatusClass(result.status);
+    divBadge.textContent = window.DivergenceAPI.getStatusText ? window.DivergenceAPI.getStatusText(result.status) : result.status.toUpperCase();
+    divBadge.className = 'div-badge ' + (window.DivergenceAPI.getStatusClass ? window.DivergenceAPI.getStatusClass(result.status) : 'div-ok');
     if (result.status === 'divergent') {
-      divReason.textContent = `Difference ${result.divergencePct.toFixed(1)} pp exceeds ${config.thresholdPct} pp threshold`;
+      divReason.textContent = `Device moment % (transmitted, kept as-is) vs model util % (capacityAt): diff ${result.divergencePct.toFixed(1)} pp exceeds ${config.thresholdPct} pp threshold — using last accepted sample`;
     } else {
-      divReason.textContent = `Values agree within ${config.thresholdPct} pp threshold`;
+      divReason.textContent = `Device moment % (transmitted, kept as-is) vs model util % (capacityAt): within ${config.thresholdPct} pp threshold — using last accepted sample`;
     }
   }
 }

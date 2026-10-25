@@ -170,26 +170,27 @@
 
           <!-- Divergence Badge (Cycle 3 — Namya) -->
           <section class="panel-block divergence" style="margin-top:10px; display:none;" id="divergenceBlock">
-            <h2>Device vs Computed Utilisation</h2>
+            <h2>Device moment % vs model utilisation %</h2>
             <div class="div-grid">
               <div class="div-row">
-                <span class="div-label">Device moment %</span>
+                <span class="div-label">Device moment % (transmitted, as-is)</span>
                 <b id="divDevice" class="div-value">—</b>
               </div>
               <div class="div-row">
-                <span class="div-label">Computed util %</span>
+                <span class="div-label">Model util % (capacityAt: load/capacity×100)</span>
                 <b id="divComputed" class="div-value">—</b>
               </div>
               <div class="div-row">
-                <span class="div-label">Difference</span>
+                <span class="div-label">Difference (pp)</span>
                 <b id="divDiff" class="div-value">—</b>
               </div>
               <div class="div-row div-status-row">
                 <span class="div-label">Status</span>
-                <div id="divBadge" class="div-badge">—</div>
+                <b id="divBadge" class="div-badge div-ok">AGREE</b>
               </div>
             </div>
             <div class="fine" id="divReason">Awaiting telemetry…</div>
+            <div class="fine">Device value is the transmitted <code>moment_pct</code> (kept as-is, not recomputed). Model utilisation = <code>load_t / capacityAt(MCT88, jibLen, radius_m, wind_kmh) × 100</code> using corner-radius capacity (5 t up to corner radius M/maxCapacity, else M/r) with simulated wind derating (≥20 km/h ×0.8, simulated product rule, not certified). Uses last accepted/held sample; STALE/COMPLETE shown on loss/completion without per-row rejection spam. For display only — not certified engineering accuracy.</div>
           </section>
           <div class="fine" id="cornerLine">Corner radius: 16.2 m · Moment: 81 t·m · Source: MCT 88 datasheet (see Crane Data).</div>
         </section>

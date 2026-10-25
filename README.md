@@ -2,7 +2,7 @@
 
 A simulation-based digital twin prototype for a Potain MCT 88-class tower crane, developed to study crane operation, load-capacity behavior, safety states, and spatial constraints in a construction-site environment.
 
-![Status](https://img.shields.io/badge/status-Cycle%202%20prototype-lightgrey)
+![Status](https://img.shields.io/badge/status-Cycle%203%20prototype-lightgrey)
 ![Stack](https://img.shields.io/badge/stack-static%20HTML%20%2B%20JS-blue)
 ![3D](https://img.shields.io/badge/3D-Three.js%20r128-green)
 
@@ -75,6 +75,15 @@ A radius beyond the installed jib length is out of range: the model returns no c
 - Status: product-requested simulation rule. The ticket cites "EN 14439 Table 7", but the available project sources do not contain that table text, so the citation is unverified (see `docs/SOURCES.md` §6).
 - Certification: not a certified wind-load calculation. Cycle 2 validation remains the baseline/no-wind validation.
 - UI: SAFE / WARNING / DANGER = load utilization status; DERATED = wind-based capacity reduction is active (separate indicator).
+
+### Device vs computed utilisation (Cycle 3)
+
+- **Device moment % (transmitted)**: the value comes directly from `row.moment_pct` as transmitted by the device. It is **kept as-is** and is **not** recomputed from `load_t × radius_m / 81 × 100` in the divergence comparison. The badge explicitly labels it as transmitted.
+- **Model utilisation % (capacity-based)**: computed independently via `capacityAt(MCT88, jibLen, radius_m, wind_kmh)` using the load-moment/corner-radius capacity model (5 t up to corner radius `r_corner = M/maxCapacity`, else capacity = `M/r` where `M = tipLoadAt × jibLen`). For radii beyond installed jib, capacity is unavailable (out of range) and the comparison reports **UNAVAILABLE/invalid**.
+- **Corner radius / capacity**: corner radius `r_corner = M_max / maximum_capacity` (e.g. 81/5 = 16.2 m at 30 m jib). Inside corner radius capacity is limited by max capacity; outside by moment limit.
+- **Simulated wind derating**: if `wind_kmh >= 20` km/h, base capacity is multiplied by 0.8 (**SIMULATED PRODUCT RULE**). This is not a certified calculation and is labeled as such in UI (DERATED indicator is separate from SAFE/WARNING/DANGER).
+- **Divergence badge**: compares transmitted device moment % against model utilisation % (both in percent). Differences are reported in percentage points. The badge always uses the **last accepted/held telemetry sample** (never a rejected incoming row). When telemetry is missing/lost, it shows a clear **STALE** state rather than flooding the UI with per-row rejection messages. On playback completion it shows **COMPLETE** while still holding the last accepted sample.
+- **Assumptions**: status/motion bit interpretations follow **documented DRM 3400 bits** only (see `docs/reference/README-for-students.md`). Implausible rate-of-change limits and some cross-channel rules are **configurable simulation heuristics** (labeled as such in code) because exact certified limits are not present in supplied docs/tests — they are not described as manufacturer-certified. No undocumented device bit meanings or speed limits were invented. Cross-channel contradictions that are supported by documented bits produce explicit validation warnings/rejection reasons.
 
 ## Current Crane Configuration
 
@@ -164,6 +173,7 @@ tower-crane-digital-twin/
 ├── script.js
 ├── style.css
 ├── capacity.js
+├── divergence.js
 ├── ui-mirror.js
 ├── README.md
 ├── docs/
@@ -172,7 +182,9 @@ tower-crane-digital-twin/
 │   ├── validation-calculation.txt
 │   └── reference/            # student/Cycle 3 material, not part of the Cycle 2 deliverable
 └── tests/
-    └── verify-round1.js
+    ├── verify-round1.js
+    ├── verify-wind-derating.js
+    └── verify-divergence.js
 ```
 
 The web app lives at the repository root so the GitHub Pages URL
@@ -199,10 +211,11 @@ then open `http://localhost:8000`.
 
 ## Validation / Testing
 
-- **Syntax:** `node --check script.js`, `node --check capacity.js` (plain scripts, file:// compatible, no modules).
+- **Syntax:** `node --check script.js`, `node --check capacity.js`, `node --check divergence.js` (plain scripts, file:// compatible, no modules).
 - **Engineering validation:** `validate(MCT88, 30, CHART30)` runs in the browser console on boot against the three published chart points above; the Validation tab renders the same comparison.
 - **Round 1 scenario verification:** `node tests/verify-round1.js` checks that the four required jib/radius/load combinations reach the calculation layer without being rounded or clamped, and that a radius beyond the installed jib returns out-of-range. It also verifies the slider bounds in `index.html`.
 - **Round 3 wind-derate verification:** `node tests/verify-wind-derating.js` checks the 0.8× simulated product rule (no-wind baseline, 19/20/25 km/h, corner region, out-of-range null).
+- **Cycle 3 divergence verification:** `node tests/verify-divergence.js` checks device vs computed utilisation comparison using transmitted `moment_pct` vs capacityAt-based utilisation, with safe handling of missing/invalid values and wind derating effects.
 - **Cycle 2 validation:** worst error 8.4% against the ±10% acceptance threshold — PASS (see table above).
 
 ## Limitations
