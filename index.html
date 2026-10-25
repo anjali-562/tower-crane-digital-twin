@@ -192,6 +192,27 @@
             <div class="fine" id="divReason">Awaiting telemetry…</div>
             <div class="fine">Device value is the transmitted <code>moment_pct</code> (kept as-is, not recomputed). Model utilisation = <code>load_t / capacityAt(MCT88, jibLen, radius_m, wind_kmh) × 100</code> using corner-radius capacity (5 t up to corner radius M/maxCapacity, else M/r) with simulated wind derating (≥20 km/h ×0.8, simulated product rule, not certified). Uses last accepted/held sample; STALE/COMPLETE shown on loss/completion without per-row rejection spam. For display only — not certified engineering accuracy.</div>
           </section>
+
+          <!-- Data-quality panel (Cycle 3 — Anjali) -->
+          <section class="panel-block validation" id="validationBlock">
+            <h2>Telemetry validation <span class="live-mini">CYCLE 3</span></h2>
+            <div class="dq-grid">
+              <div class="dq-row"><span class="dq-label">CSV rows validated</span><b id="dqTotal" class="dq-value">0</b></div>
+              <div class="dq-row"><span class="dq-label">Accepted</span><b id="dqAccepted" class="dq-value">0</b></div>
+              <div class="dq-row"><span class="dq-label">Rejected (held)</span><b id="dqRejected" class="dq-value">0</b></div>
+              <div class="dq-row"><span class="dq-label">Warnings</span><b id="dqWarnings" class="dq-value">0</b></div>
+              <div class="dq-row"><span class="dq-label">Held last good</span><b id="dqHeld" class="dq-value">0</b></div>
+            </div>
+            <div class="dq-current">
+              <span class="dq-label">Current sample</span>
+              <b id="dqCurrent" class="dq-value">—</b>
+              <span id="dqCurrentBadge" class="dq-badge dq-idle">—</span>
+            </div>
+            <div class="fine" id="dqLastReason">No telemetry loaded.</div>
+            <div class="fine" id="dqRuleBreakdown">Rules hit: —</div>
+            <ul id="dqRecent" class="dq-recent"></ul>
+            <div class="fine">Dataset-level counters; replaying a row does not double-count it. REJECT holds the last accepted crane state.</div>
+          </section>
           <div class="fine" id="cornerLine">Corner radius: 16.2 m · Moment: 81 t·m · Source: MCT 88 datasheet (see Crane Data).</div>
         </section>
 
@@ -451,6 +472,7 @@
 <div id="glError" class="gl-error hidden"></div>
 
 <script src="capacity.js"></script>
+<script src="telemetry-validation.js"></script>
 <script src="divergence.js"></script>
 <script src="script.js"></script>
 <script src="ui-mirror.js"></script>

@@ -75,7 +75,11 @@ const T = {
   acceptedCount: 0,
   rejectedCount: 0,
   lastRejectionReason: '',
-  rejectionReasons: Object.create(null)
+  rejectionReasons: Object.create(null),
+  validationStore: null,
+  playbackSession: null,
+  lastValidation: null,
+  lastAppliedRow: null
 };
 
 // Pure telemetry helpers are exposed before the THREE guard so they can be
@@ -88,6 +92,16 @@ window.TelemetryAPI = {
   isTelemetryComplete,
   formatRejectionSummary,
   getCurrentTelemetryRow,
+  getDeviceMomentPct,
+  getComputedUtilization,
+  getValidationState: () => ({
+    total: T.validationStore ? T.validationStore.total : 0,
+    accepted: T.validationStore ? T.validationStore.accepted : 0,
+    rejected: T.validationStore ? T.validationStore.rejected : 0,
+    held: T.validationStore ? T.validationStore.held : 0,
+    warnings: T.validationStore ? T.validationStore.warnings : 0,
+    byRule: T.validationStore ? Object.assign({}, T.validationStore.byRule) : {}
+  }),
   getTelemetryState: () => ({
     mode: T.mode,
     playing: T.playing,
@@ -334,6 +348,41 @@ function recordRejection(reason, rawRow, line, detail) {
   if (T.onInvalidRow) T.onInvalidRow(rawRow, line, detail || reason);
 }
 
+function firstValidationRejectReason(res) {
+  if (!res || !res.reasons || res.reasons.length === 0) return '';
+  return res.reasons[0];
+}
+
+// Cycle 3 chronology checks can reject a row the validation module merely
+// warned about (or accepted). Keep the store/panel counts consistent with the
+// final playback decision without counting the row twice.
+function markStoreRejected(store, res, reason, row, line) {
+  if (!store || !res || !res.valid) return;
+  store.accepted = Math.max(0, (store.accepted || 0) - 1);
+  if (res.severity === 'warn') store.warnings = Math.max(0, (store.warnings || 0) - 1);
+  store.rejected = (store.rejected || 0) + 1;
+  store.held = (store.held || 0) + 1;
+  store.byRule[reason] = (store.byRule[reason] || 0) + 1;
+  store.reasonHits[reason] = (store.reasonHits[reason] || 0) + 1;
+  res.valid = false;
+  res.severity = 'reject';
+  res.action = 'reject-hold';
+  res.reasons.push(reason);
+  res.findings.push({ rule: reason, severity: 'reject', message: reason });
+  store.lastResult = res;
+  const rowId = String(res.rowId);
+  store.recent = (store.recent || []).filter(item => String(item.rowId) !== rowId);
+  store.recent.unshift({
+    rowId: res.rowId,
+    line,
+    timestamp: row.ts,
+    severity: 'reject',
+    reasons: res.reasons.slice(),
+    findings: res.findings.slice()
+  });
+  if (store.recent.length > 50) store.recent.length = 50;
+}
+
 function parseTelemetryCSV(csvText) {
   const lines = String(csvText).trim().split(/\r?\n/);
   if (lines.length < 2) throw new Error('CSV empty or header only');
@@ -344,102 +393,152 @@ function parseTelemetryCSV(csvText) {
     throw new Error('CSV header mismatch: expected ' + expected.join(',') + ' got ' + header.join(','));
   }
 
+
   const allParsed = [];
+  const validationStore = (typeof TelemetryValidation !== 'undefined')
+    ? TelemetryValidation.createStore()
+    : null;
   for (let i = 1; i < lines.length; i++) {
     const line = lines[i].trim();
     if (!line) continue;
     const cols = line.split(',');
+
+    const lineNo = i + 1;
     if (cols.length !== 10) {
       recordRejection('column count mismatch', line, i,
         'column count mismatch (expected 10, got ' + cols.length + ')');
       continue;
     }
-    const ts = cols[0].trim();
-    const tsMs = Date.parse(ts);
-    if (isNaN(tsMs)) {
-      recordRejection('invalid timestamp', line, i, 'invalid timestamp: ' + ts);
-      continue;
-    }
-    const load_t = parseFloat(cols[2]);
-    const radius_m = parseFloat(cols[3]);
-    const slew_deg = parseFloat(cols[4]);
-    const hook_height_m = parseFloat(cols[5]);
-    const wind_kmh = parseFloat(cols[6]);
-    const moment_pct = parseFloat(cols[7]);
-    const status_word = parseInt(cols[8], 10);
 
-    if ([load_t, radius_m, slew_deg, hook_height_m, wind_kmh, moment_pct].some(v => isNaN(v)) || isNaN(status_word)) {
-      recordRejection('NaN in numeric field', line, i);
-      continue;
-    }
+    let row;
+    if (validationStore) {
+      // Preserve every CSV row in original device order for validation.
+      // Missing/non-numeric fields stay NaN and are rejected, never zeroed.
+      row = TelemetryValidation.parseRow(cols);
+      row.csvLine = lineNo;
+      row.raw = line;
+      row._columnCount = cols.length;
+      row._line = lineNo;
+      const vres = validationStore.handle(row, { rowId: 'L' + lineNo });
+      row.validation = vres;
+      row.tsMs = vres.timestampMs;
+    } else {
+      const ts = cols[0].trim();
+      const tsMs = Date.parse(ts);
+      if (isNaN(tsMs)) {
+        recordRejection('invalid timestamp', line, i, 'invalid timestamp: ' + ts);
+        continue;
+      }
+      const load_t = parseFloat(cols[2]);
+      const radius_m = parseFloat(cols[3]);
+      const slew_deg = parseFloat(cols[4]);
+      const hook_height_m = parseFloat(cols[5]);
+      const wind_kmh = parseFloat(cols[6]);
+      const moment_pct = parseFloat(cols[7]);
+      const status_word = parseInt(cols[8], 10);
 
-    const row = {
-      ts,
-      tsMs,
-      imei: cols[1].trim(),
-      load_t,
-      radius_m,
-      slew_deg,
-      hook_height_m,
-      wind_kmh,
-      moment_pct,
-      status_word,
-      event: cols[9].trim(),
-      _line: i + 1
-    };
+      if ([load_t, radius_m, slew_deg, hook_height_m, wind_kmh, moment_pct].some(v => isNaN(v)) || isNaN(status_word)) {
+        recordRejection('NaN in numeric field', line, i);
+        continue;
+      }
+
+      row = {
+        ts,
+        tsMs,
+        imei: cols[1].trim(),
+        load_t,
+        radius_m,
+        slew_deg,
+        hook_height_m,
+        wind_kmh,
+        moment_pct,
+        status_word,
+        event: cols[9].trim(),
+        _line: lineNo
+      };
+    }
     allParsed.push(row);
   }
 
-  // Do NOT silently sort to hide chronology issues. Keep source order as presented
-  // and reject any row that moves backwards. Accepted rows therefore always keep
-  // strictly increasing timestamps in the same order as the source file.
+  // Do NOT sort to hide chronology problems. Timestamp validation and playback
+  // stay in source order. Duplicate/backwards rows are rejected before playback;
+  // rows rejected by the validation module stay on the clock so it keeps running.
   const rows = [];
   const seenTs = new Set();
   let lastSourceTsMs = null;
+  let prevAccepted = null;
+
   for (let i = 0; i < allParsed.length; i++) {
     const r = allParsed[i];
+    if (!isFinite(r.tsMs)) {
+      const reason = firstValidationRejectReason(r.validation) || 'invalid timestamp';
+      recordRejection(reason, r, r._line || i + 1);
+      continue;
+    }
+
     const duplicate = seenTs.has(r.tsMs);
     const backwards = lastSourceTsMs != null && r.tsMs < lastSourceTsMs;
     seenTs.add(r.tsMs);
-    if (duplicate && backwards) {
-      recordRejection('Duplicate timestamp and backwards timestamp jump (out of chronological order)', r, r._line || i + 1);
-      continue;
-    }
-    if (duplicate) {
-      recordRejection('Duplicate timestamp', r, r._line || i + 1);
-      continue;
-    }
-    if (backwards) {
-      recordRejection('Backwards timestamp jump (out of chronological order)', r, r._line || i + 1);
-      continue;
-    }
-    lastSourceTsMs = r.tsMs;
 
-    const prev = rows.length > 0 ? rows[rows.length - 1] : null;
-    const v = validateTelemetryRow(r, i, prev);
-    if (!v.valid) {
-      recordRejection(v.reason, r, r._line || i + 1);
+    let reason = '';
+    let exclude = false;
+    const moduleInvalid = !!(r.validation && !r.validation.valid);
+
+    if (duplicate && backwards) {
+      reason = 'Duplicate timestamp and backwards timestamp jump (out of chronological order)';
+      exclude = true;
+    } else if (duplicate) {
+      reason = 'Duplicate timestamp';
+      exclude = true;
+    } else if (backwards) {
+      reason = 'Backwards timestamp jump (out of chronological order)';
+      exclude = true;
+    } else {
+      lastSourceTsMs = r.tsMs;
+      const legacy = validateTelemetryRow(r, i, prevAccepted);
+      if (!moduleInvalid && legacy && !legacy.valid) {
+        reason = legacy.reason;
+        exclude = true;
+      } else if (moduleInvalid) {
+        reason = firstValidationRejectReason(r.validation) || 'Rejected by telemetry validation';
+      }
+    }
+
+    if (reason) {
+      if (validationStore && r.validation && r.validation.valid) {
+        markStoreRejected(validationStore, r.validation, reason, r, r._line || i + 1);
+      }
+      recordRejection(reason, r, r._line || i + 1);
+      if (exclude) continue;
+      rows.push(r);
+      if (typeof T !== 'undefined' && T.onRowParsed) T.onRowParsed(r, rows.length - 1);
       continue;
     }
+
+    prevAccepted = r;
     rows.push(r);
-    if (typeof T !== 'undefined') {
-      T.acceptedCount++;
-    }
+    if (typeof T !== 'undefined') T.acceptedCount++;
     if (typeof T !== 'undefined' && T.onRowParsed) T.onRowParsed(r, rows.length - 1);
   }
 
   if (typeof T !== 'undefined') {
     let sourceEndTsMs = null;
     for (let i = 0; i < allParsed.length; i++) {
-      if (sourceEndTsMs === null || allParsed[i].tsMs > sourceEndTsMs) sourceEndTsMs = allParsed[i].tsMs;
+      if (isFinite(allParsed[i].tsMs) && (sourceEndTsMs === null || allParsed[i].tsMs > sourceEndTsMs)) {
+        sourceEndTsMs = allParsed[i].tsMs;
+      }
     }
     T.sourceEndTsMs = sourceEndTsMs;
+    T.validationStore = validationStore;
+    T.playbackSession = null;
   }
   return rows;
 }
 
 function applyTelemetryRow(row) {
-  if (!row) return;
+
+  // Defence in depth: a rejected sample must never reach the crane state.
+  if (!row || (row.validation && !row.validation.valid)) return false;
   // Clamp to scene bounds (same as manual slider limits)
   if (typeof THREE !== 'undefined' && THREE.MathUtils) {
     S.tHoist = THREE.MathUtils.clamp(row.hook_height_m, 1.5, MAST_TOP() - 1);
@@ -464,7 +563,29 @@ function applyTelemetryRow(row) {
   if (typeof syncSliders === 'function' && T.mode === 'live') syncSliders();
 
   // Update UI text immediately
+
   if (typeof updateUI === 'function') updateUI();
+  return true;
+}
+
+function ensurePlaybackSession() {
+  if (T.playbackSession) return T.playbackSession;
+  if (typeof TelemetryValidation === 'undefined') return null;
+  T.playbackSession = TelemetryValidation.createPlaybackSession({
+    onAccept: function (row, res) {
+      T.lastValidation = res;
+      T.lastAppliedRow = row;
+      applyTelemetryRow(row);
+    },
+    onWarn: function (res) { T.lastValidation = res; },
+    onReject: function (res) { T.lastValidation = res; },
+  });
+  return T.playbackSession;
+}
+
+function updateValidationPanel() {
+  if (!T.validationStore || typeof TelemetryValidation === 'undefined') return;
+  TelemetryValidation.renderCounterPanel(T.validationStore, document, T.lastValidation || null)
 }
 
 function telemetryTick(nowMs) {
@@ -487,11 +608,18 @@ function telemetryTick(nowMs) {
   const simElapsedMs = (nowMs - T.startWallMs) * T.speed;
   const targetTsMs = T.startTsMs + simElapsedMs;
 
-  // Consume all rows whose timestamp ≤ target (do not reorder dataset)
+
+  // Consume all rows whose timestamp <= target. Rejected rows advance the
+  // row/clock pointer but are never applied to the crane state.
+  const session = ensurePlaybackSession();
+  let consumed = false;
   while (T.rowIndex < T.rows.length && T.rows[T.rowIndex].tsMs <= targetTsMs) {
     const row = T.rows[T.rowIndex++];
-    applyTelemetryRow(row);
+    const res = session ? session.consume(row) : (row.validation || null);
+    T.lastValidation = res;
+    consumed = true;
   }
+  if (consumed) updateValidationPanel();
 
   // If no new rows consumed recently and playing but no updates, treat as stale
   if (T.lastAcceptedTsMs && (targetTsMs - T.lastAcceptedTsMs) > STALE_AFTER_MS) {
@@ -505,13 +633,18 @@ function telemetryTick(nowMs) {
   // End of dataset - distinct from telemetry loss
   if (T.rowIndex >= T.rows.length) {
     T.playing = false;
+
     T.complete = true;
-    // Clear stale flag in the sense of "loss" - mark as complete/stale distinct state
+    // Complete is distinct from telemetry loss: hold the last accepted sample.
     T.stale = true;
     if (T.staleSince === 0) T.staleSince = nowMs;
     if (typeof updateModeUI === 'function') updateModeUI();
+    const counts = T.validationStore ? T.validationStore.getCounts() : null;
     const status = typeof $ === 'function' ? $('telemetryStatus') : null;
-    if (status) status.textContent = 'STALE — Playback complete — ' + T.rows.length + ' rows processed (last accepted sample held)';
+    if (status) {
+      status.textContent = 'STALE - Playback complete - ' + T.rows.length + ' playable rows (last accepted sample held)' +
+        (counts ? ' - dataset: ' + counts.accepted + ' accepted, ' + counts.rejected + ' rejected/held, ' + counts.warnings + ' warnings' : '');
+    }
   }
 }
 
@@ -534,21 +667,40 @@ function resetPlayback() {
   T.playing = false;
   T.startWallMs = 0;
   T.startTsMs = 0;
+
   T.stale = false;
   T.staleSince = 0;
   T.complete = false;
+  T.lastValidation = null;
+  T.lastAppliedRow = null;
+  T.playbackSession = null;
+
   if (T.rows.length > 0) {
     T.startTsMs = T.rows[0].tsMs;
-    // Apply first row immediately to set initial state
-    applyTelemetryRow(T.rows[0]);
-    T.rowIndex = 1;
+    // Apply the first ACCEPTED row to set the initial state. Leading rejected
+    // rows are skipped for state purposes but remain counted/diagnosed.
+    const session = ensurePlaybackSession();
+    while (T.rowIndex < T.rows.length) {
+      const row = T.rows[T.rowIndex++];
+      const res = session ? session.consume(row) : (row.validation || null);
+      T.lastValidation = res;
+      if (session) {
+        if (!res || res.valid) break;
+      } else {
+        applyTelemetryRow(row);
+        break;
+      }
+    }
   } else {
     T.lastAcceptedRow = null;
     T.lastAcceptedIndex = -1;
     T.lastAcceptedTsMs = null;
   }
+
   T.mode = 'manual';
+
   if (typeof updateModeUI === 'function') updateModeUI();
+  updateValidationPanel();
 }
 
 function setPlaybackSpeed(newSpeed) {
@@ -615,8 +767,11 @@ function setMode(newMode) {
       $('opDetail').textContent = 'Following tower-telemetry-2026-09-15.csv — drag any slider to switch to MANUAL';
     }
     S.playing = true;  // ensure crane animation runs
+
     T.stale = false;
     if (T.staleSince !== 0) T.staleSince = 0;
+    T.lastValidation = null;
+    updateValidationPanel();
   } else {
     T.mode = 'manual';
     T.playing = false;
@@ -678,13 +833,18 @@ function wireTelemetryLoader() {
       if (progressBar) progressBar.value = 100;
       if (progressText) progressText.textContent = 'Done';
 
-      if (T.rows.length === 0) throw new Error('No valid rows parsed');
+      if (T.rows.length === 0) throw new Error('No playable rows parsed (check timestamps)');
 
-      resetPlayback();  // sets startTsMs, applies row 0
-      const summary = formatRejectionSummary(T);
-      status.textContent = '✅ Loaded ' + T.rows.length.toLocaleString() + ' rows (' + (T.rows[0].ts || '') + ' → ' + (T.rows[T.rows.length-1].ts || '') + ') — ' + summary + (T.rejectedCount > 0 ? ' (see console/reasons)' : '');
+
+      const counts = T.validationStore ? T.validationStore.getCounts() : null;
+      resetPlayback();  // sets startTsMs, applies the first accepted row
+      status.textContent = '? Loaded ' + T.rows.length.toLocaleString() + ' playable rows (' +
+        (T.rows[0].ts || '') + ' ? ' + (T.rows[T.rows.length-1].ts || '') + ')' +
+        (counts ? ' ? ' + counts.accepted + ' accepted, ' + counts.rejected + ' rejected/held, ' + counts.warnings + ' warnings' : '') +
+        (T.rejectedCount > 0 ? ' (see validation panel)' : '');
       const btnLive = typeof $ === 'function' ? $('btnLive') : null;
-      if (btnLive) btnLive.disabled = false;
+      if (btnLive) btnLive.disabled = !(counts && counts.accepted > 0);
+      updateValidationPanel();
 
       if (progressDiv) setTimeout(() => { progressDiv.style.display = 'none'; }, 1000);
     } catch (err) {
@@ -723,13 +883,6 @@ function getCurrentTelemetryRow(Tstate) {
   return null;
 }
 
-// Keep TelemetryAPI definitions (also set earlier before THREE guard)
-// Extend if already exists
-if (typeof window !== 'undefined') {
-  if (!window.TelemetryAPI) window.TelemetryAPI = {};
-  window.TelemetryAPI.getDeviceMomentPct = getDeviceMomentPct;
-  window.TelemetryAPI.getComputedUtilization = getComputedUtilization;
-}
 
 // ---------- Label sprites ----------
 const labelGroup = new THREE.Group(); scene.add(labelGroup);
@@ -1842,6 +1995,12 @@ function useAsDemo() {
 try {
   if (typeof capacityAt !== 'function' || typeof hookInZone !== 'function' || typeof MCT88 === 'undefined') {
     throw new Error('capacity.js did not load — MCT88/capacityAt/hookInZone missing. Keep capacity.js next to index.html.');
+  }
+  if (typeof TelemetryValidation === 'undefined') {
+    throw new Error('telemetry-validation.js did not load — keep telemetry-validation.js next to index.html.');
+  }
+  if (typeof DivergenceAPI === 'undefined') {
+    throw new Error('divergence.js did not load — keep divergence.js next to index.html.');
   }
   if (!renderer.capabilities) throw new Error('WebGL unavailable');
   createSite();

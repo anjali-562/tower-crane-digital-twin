@@ -33,6 +33,9 @@ Everything runs as a static HTML/JavaScript application with no build step and n
 - Published-data validation
 - Validation dashboard
 - Automatic lift demonstration
+- Timestamp-driven CSV telemetry playback with a LIVE / MANUAL override
+- Device-vs-computed utilisation divergence badge (5 percentage-point tolerance)
+- Telemetry validation with REJECT / hold-last-good handling and data-quality counters
 - Engineering-oriented telemetry panel
 
 ## Engineering Model
@@ -170,21 +173,29 @@ Not yet implemented:
 ```text
 tower-crane-digital-twin/
 ├── index.html              # simulation entry point (also served by GitHub Pages)
-├── script.js
+├── script.js               # scene, playback, LIVE/MANUAL, integration
 ├── style.css
-├── capacity.js
-├── divergence.js
+├── capacity.js             # load-moment capacity model
+├── divergence.js           # Cycle 3 device-vs-computed badge
+├── telemetry-validation.js # Cycle 3 validation, counters, playback session
 ├── ui-mirror.js
 ├── README.md
 ├── docs/
 │   ├── CYCLE2_SUMMARY.md
 │   ├── SOURCES.md
 │   ├── validation-calculation.txt
-│   └── reference/            # student/Cycle 3 material, not part of the Cycle 2 deliverable
+│   └── reference/
+│       ├── README-for-students.md
+│       └── tower-telemetry-2026-09-15.csv   # supplied synthetic dataset
 └── tests/
     ├── verify-round1.js
     ├── verify-wind-derating.js
-    └── verify-divergence.js
+    ├── verify-divergence.js
+    ├── verify-validation.js
+    ├── verify-playback-integration.js
+    ├── verify-cycle3-audit.js
+    ├── verify-cycle3-audit2.js
+    └── verify-cycle3-audit3.js
 ```
 
 The web app lives at the repository root so the GitHub Pages URL
@@ -211,12 +222,17 @@ then open `http://localhost:8000`.
 
 ## Validation / Testing
 
-- **Syntax:** `node --check script.js`, `node --check capacity.js`, `node --check divergence.js` (plain scripts, file:// compatible, no modules).
+- **Syntax:** `node --check script.js`, `node --check capacity.js`, `node --check divergence.js`, `node --check telemetry-validation.js` (plain scripts, file:// compatible, no modules).
 - **Engineering validation:** `validate(MCT88, 30, CHART30)` runs in the browser console on boot against the three published chart points above; the Validation tab renders the same comparison.
 - **Round 1 scenario verification:** `node tests/verify-round1.js` checks that the four required jib/radius/load combinations reach the calculation layer without being rounded or clamped, and that a radius beyond the installed jib returns out-of-range. It also verifies the slider bounds in `index.html`.
 - **Round 3 wind-derate verification:** `node tests/verify-wind-derating.js` checks the 0.8× simulated product rule (no-wind baseline, 19/20/25 km/h, corner region, out-of-range null).
-- **Cycle 3 divergence verification:** `node tests/verify-divergence.js` checks device vs computed utilisation comparison using transmitted `moment_pct` vs capacityAt-based utilisation, with safe handling of missing/invalid values and wind derating effects.
+- **Cycle 3 divergence verification:** `node tests/verify-divergence.js` checks agreement/divergence cases, the 5 percentage-point threshold, invalid inputs, wind derating, and formatting.
+- **Cycle 3 telemetry validation:** `node tests/verify-validation.js` runs 65 checks: synthetic valid/invalid rows, REJECT/hold/WARN policy, counter idempotence, panel rendering, and a read-only scan of the supplied CSV (46,800 rows).
+- **Cycle 3 playback integration:** `node tests/verify-playback-integration.js` runs 18 checks against the real `parseTelemetryCSV()`: merged source-order counts, hold-last-good behaviour, session rejection, timestamp clock, and preservation of the LIVE/MANUAL and divergence wiring.
+- **Cycle 3 audit regressions:** `node tests/verify-cycle3-audit.js` (11 checks), `verify-cycle3-audit2.js` (14 checks) and `verify-cycle3-audit3.js` (19 checks) cover transmitted `moment_pct`, rejection counting, stale/complete, resume without replay, and duplicate/backwards reasons.
 - **Cycle 2 validation:** worst error 8.4% against the ±10% acceptance threshold — PASS (see table above).
+
+Current test status on this branch: **all five required suites and all three Cycle 3 audit suites pass** — `verify-round1`, `verify-wind-derating`, `verify-divergence`, `verify-validation` (65/65), `verify-playback-integration` (18/18), audits 11/11, 14/14 and 19/19.
 
 ## Limitations
 
@@ -226,24 +242,199 @@ then open `http://localhost:8000`.
 - No live physical crane sensor feed is currently connected.
 - No structural dynamics model.
 - No wind-load physics model (Round 3 adds a SIMULATED 0.8× product derate at ≥ 20 km/h; not a certified wind-load calculation. The categorical LOW/MODERATE/HIGH wind remains visual only).
-- No certified lift planning.
+- No certified lift planning; this prototype does not replace qualified crane operators or approved lift-planning procedures.
+- Telemetry validation is a data-quality layer, not certified safety logic. Limits are guide/dataset interpretations; jump thresholds are review heuristics, not manufacturer speed limits (see Cycle 3 section).
+- Validation is per-row. It does not cross-check `status_word` against actual motion, detect slow sensor drift, or estimate load-cell calibration error.
+- The 300-row frozen block is handled as 300 individual hold-last-good events. The ordinary playback STALE state appears after 5 s without a new accepted sample; there is no separate per-dropout banner.
+- No live physical feed in this prototype: Cycle 3 replays the supplied synthetic CSV offline.
 - No production operational deployment.
 
 ## Source / References
 
 Manufacturer and chart sources are documented in [`docs/SOURCES.md`](docs/SOURCES.md). The primary source is the official Manitowoc Potain e-catalogue (EN 14439 C25 range); per-radius validation values were read from the Potain MCT 88 data sheet (FEM 1.001-A3, "Load charts" page, 98 ft row). See that file for document codes, conversion notes, and known discrepancies.
 
+## Cycle 3 — Telemetry validation and anomaly handling
+
+Scope: the assigned Cycle 3 validation/anomaly module for the supplied synthetic stream
+`docs/reference/tower-telemetry-2026-09-15.csv` (46,800 rows, 1 Hz, 06:00:00–18:59:59 IST).
+Playback timing, the LIVE/MANUAL override and the divergence badge belong to the other Cycle 3
+modules and are deliberately untouched: the validation layer decides *which* samples may move the
+crane, not *when* playback advances.
+
+Implementation:
+
+- `telemetry-validation.js` — named checks, hold-last-good store, data-quality counters, playback session and optional counter-panel renderer. Plain script, `file://`-compatible, global `TelemetryValidation`.
+- `script.js` — `parseTelemetryCSV()` validates every row at load in source order, applies the Cycle 3 chronology/cross-channel checks, and withholds the three rows that fail them; `telemetryTick()` consumes the remaining playable rows through `TelemetryValidation.createPlaybackSession()`; `applyTelemetryRow()` keeps a final `validation.valid` guard.
+- `index.html` / `style.css` — "Telemetry validation (CYCLE 3)" panel with counters, current-sample badge/reason, per-rule breakdown and recent anomalies.
+- `tests/verify-validation.js` and `tests/verify-playback-integration.js` — 65 + 18 checks.
+
+### How a sample is handled
+
+1. **Validate before the crane moves.** All 46,800 rows are validated in original device order at load time, and the result is attached to the row (`row.validation`). The store is dataset-level: counters do not change when playback revisits a row. The CSV is never sorted.
+2. **Only valid rows reach the state.** The playback session calls `onAccept` for OK and WARN rows. A REJECT row never reaches `applyTelemetryRow()`, so the crane keeps its last accepted state. Cycle 3 chronology checks also hard-withhold duplicate/backwards rows and the documented-bit cross-channel contradiction before the session sees them.
+3. **The clock keeps running.** `telemetryTick()` advances the timestamp-driven row pointer independently of the verdict. Rejecting a sample does not pause, stop or rewind playback; the next valid sample updates the crane normally. The three rows withheld by the parser are skipped without stretching or sorting the remaining timeline.
+4. **Nothing is clamped into validity and nothing is silently zeroed.** Missing fields become `NaN` and reject; out-of-range values stay out of range and reject. The scene-bound clamps in `applyTelemetryRow()` remain as a final guard, but they are wider than the validation ranges, so accepted telemetry passes through unchanged (the only edge case is an accepted −0.02 t noise-floor reading, which the clamp displays as 0 t).
+5. **A second guard.** `applyTelemetryRow()` refuses any row whose `validation.valid` is false.
+6. **The panel stays visible.** Counters, the current-sample badge/reason (OK / WARN / REJECT), the per-rule breakdown and the five most recent anomalies are rendered from the store.
+
+| Verdict | Meaning | Playback action |
+|---|---|---|
+| **REJECT** | Required data missing/non-finite, state outside the documented envelope, impossible timestamp, or another conclusively invalid sample | Do not update the crane; hold the last accepted state; keep the clock running; show the timestamp and reasons |
+| **WARN** | Suspicious but not conclusively impossible (boundary rounding, jump heuristic) | Apply the row and keep the warning visible |
+| **OK** | No findings | Apply the row |
+
+The validation module classifies a duplicate/out-of-order timestamp as WARN, but the merged playback policy preserves the earlier Cycle 3 rule: a duplicate or backwards source timestamp is withheld and counted as a final rejection. The store counters are adjusted once so the panel matches playback.
+
+### Named checks and thresholds
+
+| Check | Rule | Severity |
+|---|---|---|
+| `checkFiniteValues` | Required `load_t`, `radius_m`, `slew_deg`, `hook_height_m`, `wind_kmh` must be finite; blank/NaN/Infinity is never coerced to 0 | REJECT |
+| `checkLoadRange` | `−0.02 t ≤ load_t ≤ 5 t`. The lower bound is the documented ±0.02 t load-cell noise around an unloaded hook; the upper bound is the MCT 88 rated maximum | REJECT |
+| `checkWindRange` | `wind_kmh ≥ 0`; a negative anemometer reading is impossible. 40 km/h is the kit's alert threshold, so there is no upper validity cap | REJECT |
+| `checkRadiusRange` | `4 m ≤ radius_m ≤ 29 m` (guide: trolley travel "about 4–29 m"); no clamping, no zero special case | REJECT |
+| `checkHookHeightRange` | `2 m ≤ hook_height_m ≤ 46 m` (guide: "roughly 2–46 m"); no clamping | REJECT |
+| `checkSlewRange` | `−180° ≤ slew_deg ≤ +180°`; crossing the ±180° wrap is normal. Overshoot ≤ 0.5° is treated as rounding; more than 0.5° beyond the limit is invalid | WARN (≤ 0.5°) / REJECT (> 0.5°) |
+| `checkTimestamp` | Strict ISO-8601 with an explicit offset and a real calendar date; the browser timezone is never assumed. The module flags duplicate/out-of-order timestamps as WARN; the merged playback policy withholds them in source order | REJECT (missing/unparseable; merged duplicate/backwards) / WARN (module-level duplicate/out-of-order) |
+| `checkPhysicalJump` | Review heuristic scaled by elapsed time: radius change > 5 m/s, hook change > 3 m/s, wrap-aware slew change > 10 °/s | WARN only |
+| `checkAuxiliaryFields` | `moment_pct` finite and non-negative (else divergence is UNAVAILABLE), `status_word` integer in `0..8191`, non-empty `imei`, empty or documented `event`, exactly 10 columns | WARN only |
+
+Interpretation notes (project choices, not certified limits):
+
+- The load tolerance is intentionally asymmetric: −0.02 t absorbs documented noise around an unloaded hook, while 5 t is a hard rated maximum. Zero load with otherwise valid fields is VALID — 39,595 accepted rows read exactly 0.00 t.
+- Radius and hook ranges are the *approximate* operating envelope stated in the supplied column dictionary, treated here as inclusive strict bounds for this dataset.
+- Jump thresholds were derived from the largest anomaly-free one-second changes observed in the supplied CSV (radius ≤ 4.0 m/s, hook ≤ 0.7 m/s, slew ≤ 4.2 °/s) plus headroom. The kit sources state no crane speed limit, so a jump is never called "physically impossible"; it is flagged for review while playback continues.
+
+### Full-dataset result (read-only scan)
+
+The source CSV is never modified; the validation test recomputes its canonical LF Git blob SHA-1 and asserts that it matches the recorded hash.
+
+Module-level scan (`telemetry-validation.js` on its own):
+
+| Metric | Count |
+|---|---|
+| Rows validated | 46,800 |
+| Accepted | 46,496 |
+| Rejected / held last good | 304 |
+| Warnings | 144 |
+| Zero-load rows accepted | 39,595 |
+
+Merged parser/playback (`script.js` + validation module, as used by the app):
+
+| Metric | Count |
+|---|---|
+| Rows validated | 46,800 |
+| Playable rows in source order | 46,797 |
+| Applied / accepted | 46,493 |
+| Final rejected / held | 307 |
+| Warnings | 142 |
+
+Rejected rows by category:
+
+| Category | Rows | Lines (header = line 1) | What the rules see |
+|---|---|---|---|
+| Single-sample physically impossible spikes | 3 | 5653, 7962, 14285 | See the next subsection |
+| Missing telemetry | 1 | 42933 | Empty `load_t`; rejected by `checkFiniteValues`, not defaulted to 0 |
+| Suspected sensor dropout | 300 | 16382–16681 (10:33:00–10:37:59) | Every field frozen at zero; each row individually rejected by `checkRadiusRange` + `checkHookHeightRange`; line 16682 resumes normal values |
+| Duplicate + backwards source timestamp | 1 | 28944 | Duplicate instant of line 28914 and earlier than the preceding source timestamp; withheld in source order |
+| Duplicate source timestamp | 1 | 33589 | Duplicate of line 33588; withheld in source order |
+| Documented-bit cross-channel contradiction | 1 | 24671 | Overload bit set with implausibly low moment/load; withheld by the Cycle 3 cross-channel check |
+
+Counters (`store.getCounts()`) count unique rows by `rowId` (CSV line number); replaying a row for display revalidates it but does not increment counters or duplicate the anomaly list. `byRule` counts affected *rows* per rule, while `reasonHits` counts individual findings; a row that trips two rules counts once in each. Module-only rule hits: `checkRadiusRange` 301 · `checkHookHeightRange` 301 · `checkSlewRange` 139 · `checkPhysicalJump` 6 rows / 8 reasons · `checkTimestamp` 2 rows / 3 reasons · `checkLoadRange` 1 · `checkFiniteValues` 1 · `checkWindRange` 0 · `checkAuxiliaryFields` 0. The merged store additionally counts the three Cycle 3 withholdings exactly once, so its totals are 46,493 accepted / 307 rejected / 142 warnings. The 300 dropout rows trip radius and hook together, which is why `byRule` sums to more than the row count.
+
+Warnings in the merged run: 139 slew boundary overshoots (readings of ±180.1°/180.2°) and 3 jump-only review warnings. The module's two timestamp warnings are the duplicate/backwards rows at lines 28944 and 33589, which the merged playback policy withholds as final rejections. These rows and their immediate neighbours are the only departures from the 1 Hz cadence in the file (four non-1000 ms gaps in total); every other consecutive timestamp gap is exactly 1000 ms.
+
+### First three physically impossible rows
+
+Line numbers include the header, so data starts at line 2. These are the first three hard rejections in device/line order; each is a single-sample spike bracketed by normal rows.
+
+**1. Line 5653 — `2026-09-15T07:34:11+05:30` — `radius_m = 33.40 m`**
+
+Rule: `checkRadiusRange`. Evidence: trolley travel is about 4–29 m and the installed jib is 30 m, so 33.40 m is beyond the jib; the previous and next rows read 9.60 m. Raw line:
+
+```csv
+2026-09-15T07:34:11+05:30,000000000000001,3.41,33.40,-139.8,33.00,9.2,140.6,393,
+```
+
+Handling: **REJECT — held last good** (line 5652 state, 3.46 t at 9.60 m). The clock advanced to line 5654 and the twin resumed at 9.60 m instead of drawing the teleport.
+
+**2. Line 7962 — `2026-09-15T08:12:40+05:30` — `load_t = −0.70 t`**
+
+Rule: `checkLoadRange`. Evidence: negative mass beyond the documented ±0.02 t noise floor; the previous and next rows read 0.00 t. Raw line:
+
+```csv
+2026-09-15T08:12:40+05:30,000000000000001,-0.70,28.50,-180.0,21.30,10.6,0.0,256,
+```
+
+Handling: **REJECT — held last good** (previous load 0.00 t). Playback continued to line 7963 with no animation to −0.70 t.
+
+**3. Line 14285 — `2026-09-15T09:58:03+05:30` — `hook_height_m = −1.80 m`**
+
+Rule: `checkHookHeightRange`. Evidence: hook height is measured above ground and the guide gives roughly 2–46 m; −1.80 m is below ground; the previous and next rows read 27.70 m. Raw line:
+
+```csv
+2026-09-15T09:58:03+05:30,000000000000001,0.00,7.30,-80.7,-1.80,11.0,0.0,0,
+```
+
+Handling: **REJECT — held last good** (previous hook height 27.70 m). Playback continued to line 14286 at 27.70 m.
+
+The remaining 304 final rejections are not additional single-sample spikes: 1 missing `load_t` (line 42933), the 300 frozen dropout rows (lines 16382–16681), and the 3 source-order/cross-channel withholdings at lines 28944, 33589 and 24671. The dropout is rejected per row, so the twin holds the last good pre-dropout state through the block and resumes at line 16682.
+
+### Interaction with playback, MANUAL and the divergence badge
+
+- The transport stays timestamp-driven (`tsMs`); a rejected sample does not pause, stop or rewind the clock, change the speed multiplier, or alter play/pause/resume behaviour.
+- LIVE/MANUAL is unchanged: in LIVE, accepted telemetry updates the sliders; dragging the hoist/trolley/slew/load slider drops to MANUAL exactly as before. Validation only runs while telemetry is being consumed, so it cannot overwrite manual input.
+- The divergence badge (`divergence.js`, separate Cycle 3 module) and its 5 percentage-point tolerance are unchanged. Auxiliary `moment_pct` / `status_word` problems remain WARN so the sample still plays; the documented-bit cross-channel contradiction is withheld. The badge always uses the last accepted/held sample and reports unavailable device data as UNAVAILABLE.
+- `TelemetryAPI.getValidationState()` exposes dataset counters and by-rule totals for diagnostics.
+
+### Tests and verification (actual results)
+
+Run from the repository root; no dependencies and no build step:
+
+```bash
+node tests/verify-validation.js             # 65 checks — ALL PASSED
+node tests/verify-playback-integration.js   # 18 checks — ALL PASSED
+node tests/verify-divergence.js             # teammate baseline — ALL PASSED
+node tests/verify-round1.js                 # Cycle 1 baseline — ALL PASSED
+node tests/verify-wind-derating.js          # Round 3 baseline — ALL PASSED
+node tests/verify-cycle3-audit.js           # 11 checks — ALL PASSED
+node tests/verify-cycle3-audit2.js          # 14 checks — ALL PASSED
+node tests/verify-cycle3-audit3.js          # 19 checks — ALL PASSED
+node --check telemetry-validation.js        # syntax OK (same for script.js and the other modules)
+```
+
+The validation suite includes a read-only full-file scan (module-level accepted/rejected counts above, the three first rows, the 300-row dropout, WARN playback, counter idempotence and the unchanged CSV hash). The integration suite executes the real `parseTelemetryCSV()` from `script.js` and confirms that the merged parser yields 46,797 playable rows, 46,493 reach the state applier and 304 module rejects never do; that WARN rows after dropouts still apply while the duplicate/backwards rows are withheld; that the timestamp clock, slider-to-MANUAL switch, LIVE transport and the divergence 5 pp wiring are preserved; and that replaying rows does not mutate dataset counters.
+
+### Real vs. simulated
+
+| Element | Real / sourced | Simulated or chosen in this prototype |
+|---|---|---|
+| Crane and load chart | Potain MCT 88 C25 published data: 30 m jib, 2.70 t tip, 5 t maximum, 81 t·m moment (`docs/SOURCES.md`) | `capacityAt()` is an idealised load-moment teaching model, not the complete manufacturer chart |
+| Telemetry field definitions | Field names, units and `status_word` bits follow the DRM 3400 monitor description in `README-for-students.md` | All row values are synthetic; the IMEI is a placeholder; there is no real site or device |
+| Timestamps | ISO-8601 with an explicit `+05:30` IST offset, as required for the stream | The 2026-09-15 working day is generated, not recorded |
+| Operating limits | 5 t maximum load, trolley travel about 4–29 m, hook height roughly 2–46 m, ±0.02 t load noise, −180°…+180° slew from the supplied column dictionary | Strict inclusive bounds and the 0.5° slew rounding tolerance are project interpretations for this dataset |
+| Jump thresholds | No manufacturer speed limit is supplied | 5 m/s, 3 m/s and 10 °/s are review heuristics derived from anomaly-free observed changes, not certified limits |
+| Wind | 40 km/h is the kit's alert threshold | The 0.8× capacity derate at ≥ 20 km/h is a simulated product rule; the cited EN 14439 Table 7 is unverified |
+| Divergence badge | Device `moment_pct` and recomputed utilisation are real calculations | The 5 percentage-point badge tolerance is a team UI choice, not a manufacturer limit |
+| Playback | Timestamps drive the clock, as specified | Offline CSV replay, not a live sensor connection |
+
+### Boundaries
+
+- This is a data-quality and decision-support layer, not a certified safety system.
+- Validation is per-row; it does not cross-check `status_word` against actual motion, detect slow drift, or estimate load-cell calibration error.
+- The 300-row frozen block is handled as 300 individual hold-last-good events (shown as REJECT + held counters). The normal playback STALE state appears after 5 s without a new accepted sample; there is no separate per-dropout banner.
+- A feed without a timestamp offset would be rejected entirely; that strictness is deliberate and documented in the module header.
+- Duplicate/backwards timestamps are never sorted away or merged; the affected rows are withheld and counted.
+
 ## Project Status
 
-Current milestone: **Cycle 2 — engineering validation prototype.**
+Current milestone: **Cycle 3 — telemetry-driven twin prototype.**
 
-Status: complete for the current Cycle 2 scope. The implementation demonstrates crane simulation, capacity calculation, risk assessment, spatial constraints, and published-data validation.
+Status: Cycle 3 playback, LIVE/MANUAL override, divergence badge and telemetry validation are integrated on this branch. All five required test suites and all three Cycle 3 audit suites pass. The Cycle 2 capacity validation remains the engineering baseline; the Cycle 3 dataset is synthetic and the validation layer is a data-quality guard, not a certified safety system.
 
 Possible future work (not implemented):
 
-- live telemetry integration
+- live physical sensor feed (Cycle 3 uses offline CSV replay)
 - BIM/site model integration
 - richer crane configurations
-- more detailed engineering models
-
-(End of file - will replace README.md)
+- more detailed engineering models around the validation heuristics
