@@ -35,16 +35,24 @@ const start = script.indexOf('function parseTelemetryCSV');
 const end = script.indexOf('\nfunction applyTelemetryRow', start);
 check(start !== -1 && end !== -1, '1a. parseTelemetryCSV found in script.js');
 const parserSource = script.slice(start, end);
+const constStart = script.indexOf('const RATE_LIMITS');
+const constEnd = script.indexOf('const T = {', constStart);
+const validateStart = script.indexOf('function validateTelemetryRow', constStart);
+const validateEnd = script.indexOf('\nfunction computeResumePosition', validateStart);
+const helpersStart = script.indexOf('function recordRejection', validateStart);
+const parserDeps = script.slice(constStart, constEnd) + '\n' +
+  script.slice(validateStart, validateEnd) + '\n' +
+  script.slice(helpersStart, start);
 const T = { rows: [], onRowParsed: null, onInvalidRow: null, validationStore: null };
-const sandbox = { T: T, TelemetryValidation: TV, isFinite: isFinite, console: console, Error: Error };
+const sandbox = { T: T, TelemetryValidation: TV, isFinite: isFinite, isNaN: isNaN, console: console, Error: Error };
 vm.createContext(sandbox);
-vm.runInContext(parserSource + '\nthis.parseTelemetryCSV = parseTelemetryCSV;', sandbox,
+vm.runInContext(parserDeps + '\n' + parserSource + '\nthis.parseTelemetryCSV = parseTelemetryCSV;', sandbox,
   { filename: 'script.js#parseTelemetryCSV' });
 const rows = sandbox.parseTelemetryCSV(fs.readFileSync(csvPath, 'utf8'));
-check(rows.length === 46800, '1b. parser returns 46,800 playable rows (got ' + rows.length + ')');
+check(rows.length === 46797, '1b. parser returns 46,797 playable rows (2 chronology rejects + 1 legacy reject omitted; got ' + rows.length + ')');
 const counts = T.validationStore.getCounts();
-check(counts.total === 46800 && counts.accepted === 46496 && counts.rejected === 304 && counts.warnings === 144,
-  '1c. parser attaches dataset validation: 46800 / 46496 accepted / 304 rejected / 144 warnings');
+check(counts.total === 46800 && counts.accepted === 46493 && counts.rejected === 307 && counts.warnings === 142,
+  '1c. parser attaches dataset validation: 46800 / 46493 accepted / 307 rejected / 142 warnings');
 
 // 2. Consume the actual parsed rows through a playback session with a fake
 // state applier. Rejected rows must never reach the applier.
@@ -57,13 +65,13 @@ const session = TV.createPlaybackSession({
 rows.forEach(function (row) { session.consume(row); });
 const appliedLines = new Set(applied.map(function (r) { return r.csvLine; }));
 const rejectedLines = [5653, 7962, 14285, 42933];
-check(applied.length === 46496 && session.getStats().rejected === 304,
-  '2a. session applies 46,496 rows and holds 304 rejects');
+check(applied.length === 46493 && session.getStats().rejected === 304,
+  '2a. session applies 46,493 rows and holds 304 rejects');
 check(rejectedLines.every(function (l) { return !appliedLines.has(l); }),
   '2b. known impossible/missing rows (5653, 7962, 14285, 42933) never reach the state applier');
-check(appliedLines.has(5654) && appliedLines.has(14286) && appliedLines.has(28944) &&
-  appliedLines.has(33589) && appliedLines.has(16682),
-  '2c. WARN rows and the first row after a dropout are still applied (playback not stopped)');
+check(appliedLines.has(5654) && appliedLines.has(14286) && appliedLines.has(16682) &&
+  !appliedLines.has(28944) && !appliedLines.has(33589),
+  '2c. WARN rows after dropouts still apply; duplicate/backwards rows are withheld in source order');
 check(session.getLastAccepted() && session.getLastAccepted().csvLine === 46801,
   '2d. last accepted row is the final CSV row (line 46801, header included)');
 
