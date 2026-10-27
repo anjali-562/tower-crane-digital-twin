@@ -84,7 +84,7 @@ check(/if \(!row \|\| \(row\.validation && !row\.validation\.valid\)\) return fa
 check(script.indexOf('TelemetryValidation.createPlaybackSession') !== -1 &&
   script.indexOf('session.consume(row)') !== -1,
   '3c. playback consumes rows through TelemetryValidation.createPlaybackSession');
-check(script.indexOf('TelemetryValidation.renderCounterPanel(T.validationStore, document, T.lastValidation || null)') !== -1,
+check(/TelemetryValidation\.renderCounterPanel\([^)]*T\.validationStore[^)]*document[^)]*T\.lastValidation \|\| null/.test(script),
   '3d. data-quality panel is fed from the validation store');
 check(script.indexOf('row.tsMs = vres.timestampMs') !== -1 &&
   script.indexOf('T.rows[T.rowIndex].tsMs <= targetTsMs') !== -1,

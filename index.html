@@ -190,7 +190,7 @@
               </div>
             </div>
             <div class="fine" id="divReason">Awaiting telemetry…</div>
-            <div class="fine">Device value is the transmitted <code>moment_pct</code> (kept as-is, not recomputed). Model utilisation = <code>load_t / capacityAt(MCT88, jibLen, radius_m, wind_kmh) × 100</code> using corner-radius capacity (5 t up to corner radius M/maxCapacity, else M/r) with simulated wind derating (≥20 km/h ×0.8, simulated product rule, not certified). Uses last accepted/held sample; STALE/COMPLETE shown on loss/completion without per-row rejection spam. For display only — not certified engineering accuracy.</div>
+            <div class="fine">Device value is the transmitted <code>moment_pct</code> (kept as-is, not recomputed). Model utilisation = <code>load_t / capacityAt(MCT88, jibLen, radius_m, wind_kmh) × 100</code> using corner-radius capacity (5 t up to corner radius M/maxCapacity, else M/r) with simulated wind derating (≥20 km/h ×0.8, simulated product rule, not certified). Uses last accepted/held sample; the badge shows STALE while the established stale policy is active and COMPLETE at playback end (complete takes precedence), without per-row rejection spam. For display only — not certified engineering accuracy.</div>
           </section>
 
           <!-- Data-quality panel (Cycle 3 — Anjali) -->
@@ -210,8 +210,9 @@
             </div>
             <div class="fine" id="dqLastReason">No telemetry loaded.</div>
             <div class="fine" id="dqRuleBreakdown">Rules hit: —</div>
+            <div class="fine" id="dqLoss">Telemetry-loss episodes: —</div>
             <ul id="dqRecent" class="dq-recent"></ul>
-            <div class="fine">Dataset-level counters; replaying a row does not double-count it. REJECT holds the last accepted crane state.</div>
+            <div class="fine">Dataset-level counters; replaying a row does not double-count it. REJECT holds the last accepted crane state. Contiguous rejects are grouped as one loss episode, while rejected/held counters stay per row; the loss line is supplied through the validation API.</div>
           </section>
           <div class="fine" id="cornerLine">Corner radius: 16.2 m · Moment: 81 t·m · Source: MCT 88 datasheet (see Crane Data).</div>
         </section>
