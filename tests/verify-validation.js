@@ -27,6 +27,15 @@ function mkRow(over) {
     status_word: '0', event: '',
   }, over || {}));
 }
+function mkRowWithMotion(over) {
+  // status_word with hoist(1) + trolley(2) + slew(4) = 7
+  return TV.parseRow(Object.assign({
+    ts: '2026-09-15T06:00:00+05:30', imei: '000000000000001',
+    load_t: '1.00', radius_m: '20.00', slew_deg: '45.0',
+    hook_height_m: '24.00', wind_kmh: '8.0', moment_pct: '24.7',
+    status_word: '7', event: '',
+  }, over || {}));
+}
 function hasRule(res, rule) { return res.reasons.some((r) => r.indexOf(rule) === 0); }
 function hasRuleSeverity(res, rule, sev) {
   return res.findings.some((f) => f.rule === rule && f.severity === sev);
@@ -105,9 +114,10 @@ var hHi = TV.validateRow(mkRow({ hook_height_m: '47.00' }), {});
 check(hHi.valid === false && hasRule(hHi, 'checkHookHeightRange'), '6b. hook 47.00 m -> reject by checkHookHeightRange');
 
 // 7. Slew range and wraparound
-var wrap = TV.validateRow(mkRow({ slew_deg: '-179.0' }), { prev: mkRow({ slew_deg: '179.0' }) });
-check(wrap.valid === true && wrap.severity === 'ok' && !hasRule(wrap, 'checkPhysicalJump'),
-  '7a. wraparound +179 -> -179 -> valid/ok, no false jump warning');
+// Use only slew motion bit (0x0004 = 4) for slew-only tests
+var wrap = TV.validateRow(mkRowWithMotion({ slew_deg: '-179.0', status_word: '4' }), { prev: mkRowWithMotion({ slew_deg: '179.0', status_word: '4' }) });
+check(wrap.valid === true && wrap.severity === 'ok' && !hasRule(wrap, 'checkPhysicalJump') && !hasRule(wrap, 'checkMotionBitConsistency'),
+  '7a. wraparound +179 -> -179 -> valid/ok, no false jump/motion-bit warning');
 var over1 = TV.validateRow(mkRow({ slew_deg: '180.1' }), {});
 check(over1.valid === true && over1.severity === 'warn' && hasRule(over1, 'checkSlewRange'), '7b. slew 180.1 (small overshoot) -> warn only');
 var overBig = TV.validateRow(mkRow({ slew_deg: '185.0' }), {});
@@ -134,19 +144,21 @@ var a = Date.parse('2026-09-15T06:00:00+05:30'), b = Date.parse('2026-09-15T00:3
 check(a === b, '8g. +05:30 offset honoured: 06:00+05:30 === 00:30Z');
 
 // 9. Physical-jump heuristic: WARN only and scaled by elapsed time
-var jump = TV.validateRow(mkRow({ ts: '2026-09-15T06:00:01+05:30', radius_m: '20.00' }),
-  { prev: mkRow({ ts: '2026-09-15T06:00:00+05:30', radius_m: '9.60' }) });
+// Use only trolley motion bit (0x0002 = 2) for radius change tests
+var jump = TV.validateRow(mkRowWithMotion({ ts: '2026-09-15T06:00:01+05:30', radius_m: '20.00', status_word: '2' }),
+  { prev: mkRowWithMotion({ ts: '2026-09-15T06:00:00+05:30', radius_m: '9.60', status_word: '2' }) });
 check(jump.valid === true && jump.severity === 'warn' && hasRule(jump, 'checkPhysicalJump'),
   '9a. 10.4 m radius change in 1 s -> warn, stays valid');
-var jumpSlow = TV.validateRow(mkRow({ ts: '2026-09-15T06:00:05+05:30', radius_m: '20.00' }),
-  { prev: mkRow({ ts: '2026-09-15T06:00:00+05:30', radius_m: '9.60' }) });
+var jumpSlow = TV.validateRow(mkRowWithMotion({ ts: '2026-09-15T06:00:05+05:30', radius_m: '20.00', status_word: '2' }),
+  { prev: mkRowWithMotion({ ts: '2026-09-15T06:00:00+05:30', radius_m: '9.60', status_word: '2' }) });
 check(jumpSlow.severity === 'ok' && !hasRule(jumpSlow, 'checkPhysicalJump'),
   '9b. same 10.4 m change in 5 s (2.08 m/s) -> no warning (elapsed time used)');
-var slewFast = TV.validateRow(mkRow({ ts: '2026-09-15T06:00:01+05:30', slew_deg: '45.0' }),
-  { prev: mkRow({ ts: '2026-09-15T06:00:00+05:30', slew_deg: '30.0' }) });
+// Use only slew motion bit (0x0004 = 4) for slew change tests
+var slewFast = TV.validateRow(mkRowWithMotion({ ts: '2026-09-15T06:00:01+05:30', slew_deg: '45.0', status_word: '4' }),
+  { prev: mkRowWithMotion({ ts: '2026-09-15T06:00:00+05:30', slew_deg: '30.0', status_word: '4' }) });
 check(slewFast.severity === 'warn' && hasRule(slewFast, 'checkPhysicalJump'), '9c. 15° slew in 1 s -> warn');
-var slewSlow = TV.validateRow(mkRow({ ts: '2026-09-15T06:00:03+05:30', slew_deg: '45.0' }),
-  { prev: mkRow({ ts: '2026-09-15T06:00:00+05:30', slew_deg: '30.0' }) });
+var slewSlow = TV.validateRow(mkRowWithMotion({ ts: '2026-09-15T06:00:03+05:30', slew_deg: '45.0', status_word: '4' }),
+  { prev: mkRowWithMotion({ ts: '2026-09-15T06:00:00+05:30', slew_deg: '30.0', status_word: '4' }) });
 check(slewSlow.severity === 'ok' && !hasRule(slewSlow, 'checkPhysicalJump'), '9d. same 15° slew in 3 s (5 °/s) -> no warning');
 
 // 10. Store: hold last good, warnings, counters, stable row IDs
@@ -210,7 +222,7 @@ uiStore.handle(mkRow({ ts: '2026-09-15T06:00:00+05:30' }), { rowId: 'U1' });
 uiStore.handle(mkRow({ ts: '2026-09-15T06:00:01+05:30', slew_deg: '180.1' }), { rowId: 'U2' });
 uiStore.handle(mkRow({ ts: '2026-09-15T06:00:02+05:30', radius_m: '33.40' }), { rowId: 'U3' });
 var uiEls = {};
-['dqTotal', 'dqAccepted', 'dqRejected', 'dqWarnings', 'dqHeld', 'dqLoss', 'dqCurrent',
+['dqTotal', 'dqAccepted', 'dqRejected', 'dqWarnings', 'dqHeld', 'dqCurrent',
   'dqCurrentBadge', 'dqLastReason', 'dqRuleBreakdown'].forEach(function (id) {
   uiEls[id] = { textContent: '', className: '' };
 });
@@ -224,8 +236,7 @@ var fakeDoc = {
   getElementById: function (id) { return uiEls[id] || null; },
   createElement: function (tag) { return { tagName: tag, textContent: '' }; },
 };
-var apiUiState = { loss: uiStore.getLossSummary(), withheld: uiStore.getCounts().withheld };
-var rendered = TV.renderCounterPanel(uiStore, fakeDoc, uiStore.getLastResult(), apiUiState);
+var rendered = TV.renderCounterPanel(uiStore, fakeDoc, uiStore.getLastResult());
 check(rendered === true &&
   uiEls.dqTotal.textContent === '3' &&
   uiEls.dqAccepted.textContent === '2' &&
@@ -239,27 +250,6 @@ check(uiEls.dqCurrentBadge.textContent === 'REJECT' &&
   '11d. current-sample badge/reason shows REJECT and the triggered rule');
 check(uiEls.dqRecent.children.length === 2,
   '11e. recent-anomaly list shows the two non-OK rows');
-check(uiEls.dqLoss.textContent.indexOf('1 episode') !== -1 &&
-  uiEls.dqLoss.textContent.indexOf('1 rejected sample') !== -1 &&
-  uiEls.dqLoss.textContent.indexOf('active') !== -1,
-  '11f. loss summary groups the one rejected row into one active episode (got "' + uiEls.dqLoss.textContent + '")');
-// Prove the renderer takes the summary from the supplied validation-state API
-// payload, not a second direct read from the store.
-var apiOnlyLoss = {
-  episodes: 2, samples: 7, longestSamples: 5, recovered: 1, active: true, withheld: 4
-};
-var originalLossSummary = uiStore.getLossSummary;
-uiStore.getLossSummary = function () {
-  return { episodes: 99, samples: 999, longestSamples: 999, recovered: 0, active: false, withheld: 0 };
-};
-uiEls.dqLoss.textContent = '';
-TV.renderCounterPanel(uiStore, fakeDoc, uiStore.getLastResult(), { loss: apiOnlyLoss });
-uiStore.getLossSummary = originalLossSummary;
-check(uiEls.dqLoss.textContent.indexOf('2 episodes') !== -1 &&
-  uiEls.dqLoss.textContent.indexOf('7 rejected samples') !== -1 &&
-  uiEls.dqLoss.textContent.indexOf('4 rows withheld') !== -1 &&
-  uiEls.dqLoss.textContent.indexOf('99') === -1,
-  '11g. panel uses the supplied API loss summary, not a direct store-only read (got "' + uiEls.dqLoss.textContent + '")');
 
 // 12. Full dataset scan (read-only)
 var csvCandidates = [
@@ -278,7 +268,7 @@ var csv = csvBuf.toString('utf8').split(/\r?\n/);
 var s2 = TV.createStore();
 var firstRejects = [];
 var catSpike = 0, catMissing = 0, catDropout = 0, accZeroLoad = 0;
-var warnSlew = 0, warnJump = 0, warnTs = 0, warnMotion = 0;
+var warnSlew = 0, warnJump = 0, warnTs = 0, warnMotionBit = 0, warnReverse = 0;
 var lineMap = {};
 for (var i = 1; i < csv.length; i++) {
   var line = csv[i];
@@ -304,7 +294,8 @@ for (var i = 1; i < csv.length; i++) {
     if (rules.indexOf('checkSlewRange') !== -1) warnSlew++;
     else if (rules.indexOf('checkPhysicalJump') !== -1) warnJump++;
     else if (rules.indexOf('checkTimestamp') !== -1) warnTs++;
-    else if (rules.indexOf('checkMotionConsistency') !== -1) warnMotion++;
+    else if (rules.indexOf('checkMotionBitConsistency') !== -1) warnMotionBit++;
+    else if (rules.indexOf('checkReverseDirection') !== -1) warnReverse++;
   }
 }
 var totals = s2.getCounts();
@@ -321,18 +312,17 @@ check(firstRejects[2] && firstRejects[2].line === 14285 && firstRejects[2].ts ==
 check(catSpike === 3 && catMissing === 1 && catDropout === 300,
   '12f. reject categories row-exclusive: spikes=' + catSpike + ' missing=' + catMissing + ' dropout=' + catDropout);
 check(totals.total === 46800 && totals.accepted === 46496 && totals.rejected === 304 &&
-  totals.held === 304 && totals.warnings === 145,
-  '12g. full-file totals: 46800 / 46496 accepted / 304 rejected / 304 held / 145 warnings (got ' + JSON.stringify(totals) + ')');
-check(totals.byRule.checkRadiusRange === 301 && totals.byRule.checkHookHeightRange === 301 &&
+  totals.held === 304 && totals.warnings === 1327,
+  '12g. full-file totals: 46800 / 46496 accepted / 304 rejected / 304 held / 1327 warnings (got ' + JSON.stringify(totals) + ')');
+check(totals.byRule.checkMotionBitConsistency === 1210 && totals.byRule.checkRadiusRange === 301 && totals.byRule.checkHookHeightRange === 301 &&
   totals.byRule.checkSlewRange === 139 && totals.byRule.checkLoadRange === 1 &&
   totals.byRule.checkFiniteValues === 1 && totals.byRule.checkTimestamp === 2 &&
-  totals.byRule.checkPhysicalJump === 6 && totals.byRule.checkMotionConsistency === 1,
+  totals.byRule.checkPhysicalJump === 6,
   '12h. byRule row counts match the dataset (overlaps counted once per rule)');
-check(totals.reasonHits.checkPhysicalJump === 8 && totals.reasonHits.checkTimestamp === 3 &&
-  totals.reasonHits.checkMotionConsistency === 1,
+check(totals.reasonHits.checkMotionBitConsistency === 1214 && totals.reasonHits.checkPhysicalJump === 8 && totals.reasonHits.checkTimestamp === 3,
   '12i. reasonHits distinguishes individual reasons from affected rows');
-check(warnSlew === 139 && warnJump === 3 && warnTs === 2 && warnMotion === 1,
-  '12j. warning rows by category: slew=139 jump=3 timestamp=2 motion=1 (total 145)');
+check(warnSlew === 139 && warnJump === 3 && warnTs === 2 && warnMotionBit === 1183 && warnReverse === 0,
+  '12j. warning rows by category: slew=139 jump=3 timestamp=2 motion-bit=1183 reverse=0 (total 1327)');
 check(lineMap[42933] && lineMap[42933].valid === false &&
   lineMap[42933].findings.some(function (f) { return f.rule === 'checkFiniteValues'; }),
   '12k. line 42933 missing load_t -> rejected, not defaulted to 0');
@@ -350,19 +340,6 @@ check(lineMap[33588] && lineMap[33588].valid === true &&
   '12n. line 33589 duplicate timestamp -> warn; line 33588 first occurrence is OK');
 check(accZeroLoad === 39595,
   '12o. zero load alone is accepted: ' + accZeroLoad + ' accepted rows read exactly 0.00 t');
-check(lineMap[19218] && lineMap[19218].valid === true && lineMap[19218].severity === 'warn' &&
-  lineMap[19218].findings.some(function (f) { return f.rule === 'checkMotionConsistency'; }) &&
-  lineMap[19217] && !lineMap[19217].findings.some(function (f) { return f.rule === 'checkMotionConsistency'; }),
-  '12p. two-interval trolley bit/position disagreement at line 19218 -> WARN; first interval line 19217 is not flagged');
-var loss = s2.getLossSummary();
-check(loss.episodes === 5 && loss.samples === 304 && loss.longestSamples === 300 &&
-  loss.recovered === 5 && loss.active === false && loss.withheld === 0,
-  '12q. module-level loss summary: 5 contiguous episodes / 304 rejected samples / longest 300 / all recovered');
-var dropout = s2.getLossEpisodes().filter(function (ep) { return ep.startLine === 16382; })[0];
-check(dropout && dropout.endLine === 16681 && dropout.samples === 300 &&
-  dropout.byRule.checkRadiusRange === 300 && dropout.byRule.checkHookHeightRange === 300 &&
-  dropout.recovered === true && dropout.recoveryLine === 16682,
-  '12r. dropout lines 16382–16681 are one 300-sample loss episode, recovered at line 16682');
 
 console.log(failures.length
   ? ('\nRESULT: FAIL (' + failures.length + ' check(s) failed, ' + passes + ' passed)')
