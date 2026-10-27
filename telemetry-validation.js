@@ -36,6 +36,17 @@
  *   event:         empty or one of the three documented labels; anything else
  *                  is WARN.
  *
+ * checkMotionConsistency cross-checks the documented motor-running bits against
+ * measured position changes. README §3 documents only "motor running" for
+ * hoist/trolley/slew; it does NOT document forward/reverse direction bits.
+ * No certified crane speed limit exists in the KIT, so this check tests only
+ * presence/absence of movement, never direction or speed. It requires two
+ * consecutive contradictory intervals to avoid flagging legitimate starts,
+ * stops and rounding. No-motion thresholds come from the CSV display
+ * resolution (0.01 m) and observed sub-degree slew jitter / the existing 0.5°
+ * rounding tolerance; these are project review tolerances, not manufacturer
+ * sensor specifications.
+ *
  * checkPhysicalJump is a WARN-only review heuristic, NOT a certified speed
  * limit: the kit sources give no crane speed limit. Thresholds are per-second
  * rates derived from the largest anomaly-free one-second changes observed in
@@ -78,6 +89,10 @@ var SLEW_WARN_TOL_DEG = 0.5; // overshoot within this -> WARN (rounding), beyond
 var JUMP_RADIUS_RATE_MPS = 5;  // WARN-only review heuristic, scaled by elapsed seconds
 var JUMP_HOOK_RATE_MPS = 3;    // normal observed max 0.7 m/s
 var JUMP_SLEW_RATE_DPS = 10;   // normal observed max 4.2 °/s
+var MOTION_EPS_RADIUS_M = 0.01; // CSV display resolution; not a sensor spec
+var MOTION_EPS_HOOK_M = 0.01;   // CSV display resolution; not a sensor spec
+var MOTION_EPS_SLEW_DEG = 0.5;  // observed sub-degree jitter + existing rounding tolerance
+var MOTION_MAX_INTERVAL_S = 2;  // documented 1 Hz; tolerate one missed row, skip larger gaps
 var STATUS_MASK_MAX = 0x1FFF;  // bits 0..12 documented in README §3
 var RECENT_CAP = 50;
 var KNOWN_EVENTS = { '': true, 'OVERLOAD_WARN': true, 'WIND_ALERT': true, 'LS_TRIP': true };
@@ -350,6 +365,106 @@ function wrapSlewDelta(a, b) {
   return d > 180 ? 360 - d : d;
 }
 
+var MOTION_CHANNELS = [
+  {
+    key: 'hoist', mask: 0x0001, hex: '0x0001', field: 'hook_height_m',
+    label: 'hook height', unit: 'm', eps: MOTION_EPS_HOOK_M, decimals: 2,
+    min: HOOK_MIN_M, max: HOOK_MAX_M,
+  },
+  {
+    key: 'trolley', mask: 0x0002, hex: '0x0002', field: 'radius_m',
+    label: 'trolley radius', unit: 'm', eps: MOTION_EPS_RADIUS_M, decimals: 2,
+    min: RADIUS_MIN_M, max: RADIUS_MAX_M,
+  },
+  {
+    key: 'slew', mask: 0x0004, hex: '0x0004', field: 'slew_deg',
+    label: 'slew angle', unit: '°', eps: MOTION_EPS_SLEW_DEG, decimals: 1,
+    min: -SLEW_LIMIT_DEG - SLEW_WARN_TOL_DEG,
+    max: SLEW_LIMIT_DEG + SLEW_WARN_TOL_DEG,
+  },
+];
+
+function statusMaskAvailable(row) {
+  return !!row && isNum(row.status_word) &&
+    row.status_word >= 0 && row.status_word <= STATUS_MASK_MAX;
+}
+
+function motionValueInRange(ch, value) {
+  return isNum(value) && value >= ch.min && value <= ch.max;
+}
+
+/* Movement over the interval ending at `current`, or NaN when the pair cannot
+ * be used. Motion presence uses position deltas only; no speed is inferred.
+ * A gap larger than MOTION_MAX_INTERVAL_S is not treated as one interval. */
+function motionIntervalDelta(ch, current, previous) {
+  if (!current || !previous) return NaN;
+  if (!isNum(current[ch.field]) || !isNum(previous[ch.field])) return NaN;
+  var a = parseTimestampStrict(current.ts);
+  var b = parseTimestampStrict(previous.ts);
+  if (!a.ok || !b.ok) return NaN;
+  var dtS = (a.ms - b.ms) / 1000;
+  if (!(dtS > 0) || dtS > MOTION_MAX_INTERVAL_S) return NaN;
+  if (ch.key === 'slew') return wrapSlewDelta(current[ch.field], previous[ch.field]);
+  return Math.abs(current[ch.field] - previous[ch.field]);
+}
+
+/* 6b. Documented motor-running bits vs measured motion.
+ *
+ * In the supplied CSV, the bit state at a sample aligns with the position
+ * change since the previous sample; this timing is an observed data convention,
+ * not a KIT-documented rule. A finding requires the same contradiction on two
+ * consecutive intervals, and both samples must have usable status bits, valid
+ * timestamps, and in-range position values. This avoids start/stop rounding and
+ * prevents already-invalid dropout rows from creating secondary warnings.
+ *
+ * This is WARN-only: no direction bit and no certified speed limit are
+ * available, so a disagreement is a review finding, not a proven machine fault.
+ */
+function checkMotionConsistency(row, ctx) {
+  var c = ctx || {};
+  var prev = c.prev || null;
+  var prev2 = c.prev2 || null;
+  if (!row || !prev || !prev2) return [];
+  if (!statusMaskAvailable(row) || !statusMaskAvailable(prev) || !statusMaskAvailable(prev2)) {
+    return [];
+  }
+
+  var out = [];
+  for (var i = 0; i < MOTION_CHANNELS.length; i++) {
+    var ch = MOTION_CHANNELS[i];
+    if (!motionValueInRange(ch, row[ch.field]) ||
+        !motionValueInRange(ch, prev[ch.field]) ||
+        !motionValueInRange(ch, prev2[ch.field])) {
+      continue;
+    }
+
+    var dPrev = motionIntervalDelta(ch, prev, prev2);
+    var dCur = motionIntervalDelta(ch, row, prev);
+    if (!isNum(dPrev) || !isNum(dCur)) continue;
+
+    var bitPrev = (prev.status_word & ch.mask) !== 0;
+    var bitCur = (row.status_word & ch.mask) !== 0;
+    var movedPrev = dPrev > ch.eps + 1e-9;
+    var movedCur = dCur > ch.eps + 1e-9;
+    var toler = ch.eps.toFixed(ch.decimals) + ' ' + ch.unit;
+    var deltas = 'Δ ' + dPrev.toFixed(ch.decimals) + ' ' + ch.unit + ' then ' +
+      dCur.toFixed(ch.decimals) + ' ' + ch.unit;
+
+    if (bitPrev && bitCur && !movedPrev && !movedCur) {
+      out.push(finding('checkMotionConsistency', 'warn',
+        ch.key + ' bit (' + ch.hex + ') ON for two consecutive intervals, but ' +
+        ch.label + ' did not move beyond ' + toler + ' (' + deltas + '); ' +
+        'status/position disagreement'));
+    } else if (!bitPrev && !bitCur && movedPrev && movedCur) {
+      out.push(finding('checkMotionConsistency', 'warn',
+        ch.key + ' bit (' + ch.hex + ') OFF for two consecutive intervals, but ' +
+        ch.label + ' moved beyond ' + toler + ' (' + deltas + '); ' +
+        'status/position disagreement'));
+    }
+  }
+  return out;
+}
+
 /* 7. Implausible position jumps between consecutive samples. WARN-only review
  * heuristic — the kit sources state NO crane speed limit, so this module never
  * certifies a jump "physically impossible". The per-second thresholds are
@@ -396,8 +511,8 @@ function checkPhysicalJump(row, prev) {
   return out;
 }
 
-/* Run all checks in device order. ctx: { seen:{}, lastMs, prev } — the store
- * threads this through; direct callers may pass {} or omit it.
+/* Run all checks in device order. ctx: { seen:{}, lastMs, prev, prev2 } — the
+ * store threads this through; direct callers may pass {} or omit it.
  * Returns { valid, severity, reasons, findings, row, timestamp, timestampMs }.
  * Policy: valid=false (REJECT) only on conclusively invalid samples; WARN
  * samples stay valid so the twin keeps following with a flag. */
@@ -413,6 +528,7 @@ function validateRow(row, ctx) {
   fs = fs.concat(checkHookHeightRange(row));
   fs = fs.concat(checkSlewRange(row));
   fs = fs.concat(checkTimestamp(row, c));
+  fs = fs.concat(checkMotionConsistency(row, c));
   fs = fs.concat(checkPhysicalJump(row, c.prev || null));
   var severity = 'ok';
   for (var i = 0; i < fs.length; i++) {
@@ -451,25 +567,31 @@ function createStore() {
     rejected: 0,
     held: 0,
     warnings: 0,
+    withheld: 0,
     byRule: {},
     reasonHits: {},
     lastResult: null,
     recent: [],
+    lossEpisodes: [],
+    _activeLoss: null,
+    _lossTrace: [],
     _counted: {},
     _seenTs: {},
     _lastMs: null,
     _prev: null,
+    _prev2: null,
 
     handle: function (rawOrParsed, opts) {
       var o = opts || {};
       var parsed = parseRow(rawOrParsed);
-      var ctx = { seen: this._seenTs, lastMs: this._lastMs, prev: this._prev };
+      var ctx = { seen: this._seenTs, lastMs: this._lastMs, prev: this._prev, prev2: this._prev2 };
       var res = validateRow(parsed, ctx);
       if (isNum(res.timestampMs)) {
         this._lastMs = res.timestampMs;
         this._seenTs[parsed.ts] = true;
         this._seenTs['@' + res.timestampMs] = true;
       }
+      this._prev2 = this._prev;
       this._prev = parsed;
 
       var rowId = (o.rowId === undefined || o.rowId === null) ? null : String(o.rowId);
@@ -481,14 +603,17 @@ function createStore() {
       res.action = res.valid ? (res.severity === 'warn' ? 'accept-warn' : 'accept') : 'reject-hold';
 
       if (fresh) {
+        this._lossTrace.push(res);
         this.total++;
         if (res.valid) {
           this.accepted++;
           if (res.severity === 'warn') this.warnings++;
           this.lastGood = parsed;
+          this.endLossEpisode(res);
         } else {
           this.rejected++;
           this.held++; // every rejection holds the last good state (never animates to impossible)
+          this.recordLossSample(res);
         }
         var seenRules = {};
         for (var i = 0; i < res.findings.length; i++) {
@@ -515,6 +640,121 @@ function createStore() {
       return res;
     },
 
+    /* Loss episodes group CONTIGUOUS rejected rows for the user-facing summary.
+     * They do not replace per-row counters, byRule/reasonHits, or `recent`:
+     * rejected/held stay per row, while one dropout becomes one episode.
+     * A valid OK/WARN row closes an active episode and records recovery. */
+    recordLossSample: function (res) {
+      var ep = this._activeLoss;
+      if (!ep) {
+        ep = {
+          startLine: res.line,
+          startTimestamp: res.timestamp,
+          endLine: res.line,
+          endTimestamp: res.timestamp,
+          samples: 0,
+          byRule: {},
+          active: true,
+          recovered: false,
+          recoveryLine: null,
+          recoveryTimestamp: null,
+          recoverySeverity: null,
+        };
+        this._activeLoss = ep;
+        this.lossEpisodes.push(ep);
+      }
+      ep.samples++;
+      ep.endLine = res.line;
+      ep.endTimestamp = res.timestamp;
+      var seenRules = {};
+      for (var i = 0; i < res.findings.length; i++) {
+        var rule = res.findings[i].rule;
+        if (!seenRules[rule]) {
+          ep.byRule[rule] = (ep.byRule[rule] || 0) + 1;
+          seenRules[rule] = true;
+        }
+      }
+    },
+
+    endLossEpisode: function (res) {
+      var ep = this._activeLoss;
+      if (!ep) return;
+      ep.active = false;
+      ep.recovered = true;
+      ep.recoveryLine = res.line;
+      ep.recoveryTimestamp = res.timestamp;
+      ep.recoverySeverity = res.severity;
+      this._activeLoss = null;
+    },
+
+    /* A module-valid row can later be withheld by the parser's final playback
+     * policy. Such a row is not a telemetry sample or recovery, so it is counted
+     * separately from both accepted and rejected playback rows. It is marked on
+     * the retained validation trace so a direct store sequence cannot let it
+     * close or split a rejection run; the parser also rebuilds from its final
+     * playable rows after applying that policy. */
+    withholdAccepted: function (res) {
+      if (!res || !res.valid) return;
+      res.withheld = true;
+      this.withheld = (this.withheld || 0) + 1;
+      this.rebuildLossEpisodes();
+    },
+
+    /* Rebuild episodes from the final playable sequence (when the parser
+     * supplies one) or from the store's retained validation trace. Withheld
+     * rows are skipped, so only rejected telemetry samples count toward an
+     * episode. Counters and per-row diagnostics are intentionally untouched. */
+    rebuildLossEpisodes: function (playbackRows) {
+      var sequence = playbackRows || this._lossTrace || [];
+      this.lossEpisodes = [];
+      this._activeLoss = null;
+      for (var i = 0; i < sequence.length; i++) {
+        var item = sequence[i];
+        var res = item && (item.validation || item);
+        if (!res || res.withheld) continue;
+        if (res.valid) this.endLossEpisode(res);
+        else this.recordLossSample(res);
+      }
+    },
+
+    getLossSummary: function () {
+      var episodes = this.lossEpisodes || [];
+      var samples = 0;
+      var longest = 0;
+      var recovered = 0;
+      for (var i = 0; i < episodes.length; i++) {
+        samples += episodes[i].samples;
+        if (episodes[i].samples > longest) longest = episodes[i].samples;
+        if (episodes[i].recovered) recovered++;
+      }
+      return {
+        episodes: episodes.length,
+        samples: samples,
+        longestSamples: longest,
+        recovered: recovered,
+        active: !!this._activeLoss,
+        withheld: this.withheld || 0,
+      };
+    },
+
+    getLossEpisodes: function () {
+      return (this.lossEpisodes || []).map(function (ep) {
+        return {
+          startLine: ep.startLine,
+          startTimestamp: ep.startTimestamp,
+          endLine: ep.endLine,
+          endTimestamp: ep.endTimestamp,
+          samples: ep.samples,
+          byRule: Object.assign({}, ep.byRule),
+          active: ep.active,
+          recovered: ep.recovered,
+          recoveryLine: ep.recoveryLine,
+          recoveryTimestamp: ep.recoveryTimestamp,
+          recoverySeverity: ep.recoverySeverity,
+        };
+      });
+    },
+
     getCounts: function () {
       return {
         total: this.total,
@@ -522,6 +762,7 @@ function createStore() {
         rejected: this.rejected,
         held: this.held,
         warnings: this.warnings,
+        withheld: this.withheld || 0,
         byRule: Object.assign({}, this.byRule),
         reasonHits: Object.assign({}, this.reasonHits),
       };
@@ -534,9 +775,12 @@ function createStore() {
     },
     reset: function () {
       this.lastGood = null; this.total = 0; this.accepted = 0; this.rejected = 0;
-      this.held = 0; this.warnings = 0; this.byRule = {}; this.reasonHits = {};
-      this.lastResult = null; this.recent = []; this._counted = {};
-      this._seenTs = {}; this._lastMs = null; this._prev = null;
+      this.held = 0; this.warnings = 0; this.withheld = 0;
+      this.byRule = {}; this.reasonHits = {};
+      this.lastResult = null; this.recent = [];
+      this.lossEpisodes = []; this._activeLoss = null; this._lossTrace = [];
+      this._counted = {}; this._seenTs = {}; this._lastMs = null;
+      this._prev = null; this._prev2 = null;
     },
   };
   return store;
@@ -574,10 +818,12 @@ function createPlaybackSession(opts) {
 }
 
 /* Optional dashboard hook: fills #dqTotal/#dqAccepted/#dqRejected/#dqWarnings/
- * #dqHeld/#dqCurrent/#dqCurrentBadge/#dqLastReason/#dqRuleBreakdown/#dqRecent
- * when a Cycle 3 counter panel exists; silent no-op otherwise. The panel itself
- * belongs to the UI layer; this function never redesigns it. */
-function renderCounterPanel(store, doc, currentResult) {
+ * #dqHeld/#dqLoss/#dqCurrent/#dqCurrentBadge/#dqLastReason/#dqRuleBreakdown/
+ * #dqRecent when a Cycle 3 counter panel exists; silent no-op otherwise. The
+ * loss summary is supplied from the application's validation-state API rather
+ * than read from the store here. The panel itself belongs to the UI layer; this
+ * function never redesigns it. */
+function renderCounterPanel(store, doc, currentResult, validationState) {
   try {
     var d = doc || (typeof document !== 'undefined' ? document : null);
     if (!d || !store) return false;
@@ -591,6 +837,27 @@ function renderCounterPanel(store, doc, currentResult) {
     set('dqRejected', String(c.rejected));
     set('dqWarnings', String(c.warnings));
     set('dqHeld', String(c.held));
+
+    var loss = validationState && validationState.loss;
+    if (!loss) {
+      set('dqLoss', 'Telemetry-loss episodes: unavailable.');
+    } else {
+      var lossText;
+      if (!loss.episodes) {
+        lossText = 'Telemetry-loss episodes: 0.';
+      } else {
+        lossText = 'Telemetry-loss episodes: ' + loss.episodes +
+          (loss.episodes === 1 ? ' episode' : ' episodes') +
+          ' · ' + loss.samples + ' rejected sample' + (loss.samples === 1 ? '' : 's') +
+          ' · longest ' + loss.longestSamples +
+          ' · ' + (loss.active ? 'active' : 'recovered');
+      }
+      if (loss.withheld) {
+        lossText += ' · ' + loss.withheld + ' row' + (loss.withheld === 1 ? '' : 's') +
+          ' withheld pre-playback';
+      }
+      set('dqLoss', lossText);
+    }
 
     var current = (currentResult === undefined) ? store.getLastResult() : currentResult;
     var badge = d.getElementById ? d.getElementById('dqCurrentBadge') : null;
@@ -645,6 +912,11 @@ return {
   JUMP_RADIUS_WARN_M: JUMP_RADIUS_RATE_MPS,
   JUMP_HOOK_WARN_M: JUMP_HOOK_RATE_MPS,
   JUMP_SLEW_WARN_DEG: JUMP_SLEW_RATE_DPS,
+  // Motion-bit review tolerances (project data-quality choices, not specs).
+  MOTION_EPS_RADIUS_M: MOTION_EPS_RADIUS_M,
+  MOTION_EPS_HOOK_M: MOTION_EPS_HOOK_M,
+  MOTION_EPS_SLEW_DEG: MOTION_EPS_SLEW_DEG,
+  MOTION_MAX_INTERVAL_S: MOTION_MAX_INTERVAL_S,
   parseTimestampStrict: parseTimestampStrict,
   parseRow: parseRow,
   checkFiniteValues: checkFiniteValues,
@@ -655,6 +927,7 @@ return {
   checkHookHeightRange: checkHookHeightRange,
   checkSlewRange: checkSlewRange,
   checkTimestamp: checkTimestamp,
+  checkMotionConsistency: checkMotionConsistency,
   checkPhysicalJump: checkPhysicalJump,
   validateRow: validateRow,
   createStore: createStore,
