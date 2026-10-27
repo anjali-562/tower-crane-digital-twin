@@ -37,6 +37,10 @@ Everything runs as a static HTML/JavaScript application with no build step and n
 - Device-vs-computed utilisation divergence badge (5 percentage-point tolerance)
 - Telemetry validation with REJECT / hold-last-good handling and data-quality counters
 - Engineering-oriented telemetry panel
+- **Motion-bit consistency checks** (status_word motion bits vs measured motion)
+- **Reverse-direction checks** (motion bit direction vs measured direction)
+- **Loss event grouping** (consecutive invalid rows grouped into single events)
+- **Auto jib suggestion** (`suggestJib()` — shortest installed jib with 15% safety margin)
 
 ## Engineering Model
 
@@ -86,6 +90,7 @@ A radius beyond the installed jib length is out of range: the model returns no c
 - **Corner radius / capacity**: corner radius `r_corner = M_max / maximum_capacity` (e.g. 81/5 = 16.2 m at 30 m jib). Inside corner radius capacity is limited by max capacity; outside by moment limit.
 - **Simulated wind derating**: if `wind_kmh >= 20` km/h, base capacity is multiplied by 0.8 (**SIMULATED PRODUCT RULE**). This is not a certified calculation and is labeled as such in UI (DERATED indicator is separate from SAFE/WARNING/DANGER).
 - **Divergence badge**: compares transmitted device moment % against model utilisation % (both in percent). Differences are reported in percentage points. The badge always uses the **last accepted/held telemetry sample** (never a rejected incoming row). When telemetry is missing/lost, it shows a clear **STALE** state rather than flooding the UI with per-row rejection messages. On playback completion it shows **COMPLETE** while still holding the last accepted sample.
+- **Observed divergence rate**: analysis of the 46,800-row synthetic dataset (`docs/reference/tower-telemetry-2026-09-15.csv`) shows **~5.22% of valid rows** (2,429 of 46,498 rows with radius ≤ 30 m jib and finite values) exceed the 5 percentage-point threshold. Primary causes: (1) inside corner radius (r < 16.2 m) where device formula `load×radius/81×100` differs from model's max-capacity-limited utilisation; (2) wind derating (≥20 km/h) where device moment_pct is unchanged but model utilisation increases due to 0.8× capacity factor; (3) sensor noise and transmission differences.
 - **Assumptions**: status/motion bit interpretations follow **documented DRM 3400 bits** only (see `docs/reference/README-for-students.md`). Implausible rate-of-change limits and some cross-channel rules are **configurable simulation heuristics** (labeled as such in code) because exact certified limits are not present in supplied docs/tests — they are not described as manufacturer-certified. No undocumented device bit meanings or speed limits were invented. Cross-channel contradictions that are supported by documented bits produce explicit validation warnings/rejection reasons.
 
 ## Current Crane Configuration
@@ -244,8 +249,9 @@ Current test status on this branch: **all five required suites and all three Cyc
 - No wind-load physics model (Round 3 adds a SIMULATED 0.8× product derate at ≥ 20 km/h; not a certified wind-load calculation. The categorical LOW/MODERATE/HIGH wind remains visual only).
 - No certified lift planning; this prototype does not replace qualified crane operators or approved lift-planning procedures.
 - Telemetry validation is a data-quality layer, not certified safety logic. Limits are guide/dataset interpretations; jump thresholds are review heuristics, not manufacturer speed limits (see Cycle 3 section).
-- Validation is per-row. It does not cross-check `status_word` against actual motion, detect slow sensor drift, or estimate load-cell calibration error.
-- The 300-row frozen block is handled as 300 individual hold-last-good events. The ordinary playback STALE state appears after 5 s without a new accepted sample; there is no separate per-dropout banner.
+- Motion-bit consistency and reverse-direction checks use documented DRM 3400 bits only; tolerances are simulation heuristics, not certified limits.
+- Loss event grouping uses a fixed 2-second gap threshold (configurable), not a certified telemetry-loss definition.
+- The 300-row frozen block is handled as 300 individual hold-last-good events (now grouped into a single loss event). The ordinary playback STALE state appears after 5 s without a new accepted sample; there is no separate per-dropout banner.
 - No live physical feed in this prototype: Cycle 3 replays the supplied synthetic CSV offline.
 - No production operational deployment.
 
@@ -298,6 +304,8 @@ The validation module classifies a duplicate/out-of-order timestamp as WARN, but
 | `checkTimestamp` | Strict ISO-8601 with an explicit offset and a real calendar date; the browser timezone is never assumed. The module flags duplicate/out-of-order timestamps as WARN; the merged playback policy withholds them in source order | REJECT (missing/unparseable; merged duplicate/backwards) / WARN (module-level duplicate/out-of-order) |
 | `checkPhysicalJump` | Review heuristic scaled by elapsed time: radius change > 5 m/s, hook change > 3 m/s, wrap-aware slew change > 10 °/s | WARN only |
 | `checkAuxiliaryFields` | `moment_pct` finite and non-negative (else divergence is UNAVAILABLE), `status_word` integer in `0..8191`, non-empty `imei`, empty or documented `event`, exactly 10 columns | WARN only |
+| `checkMotionBitConsistency` | Motion bit (hoist/trolley/slew) set but measured change below tolerance, or measured movement present but motion bit not set; conflicting limit switches (lsHookUp+lsHookDown, lsTrolleyOut+lsTrolleyIn) | WARN (consistency) / REJECT (conflicting switches) |
+| `checkReverseDirection` | Motion bit direction (via limit switches lsHookUp/Down, lsTrolleyOut/In) disagrees with measured direction (rate-based), above REVERSE_TOLERANCE thresholds | WARN only |
 
 Interpretation notes (project choices, not certified limits):
 
@@ -316,7 +324,7 @@ Module-level scan (`telemetry-validation.js` on its own):
 | Rows validated | 46,800 |
 | Accepted | 46,496 |
 | Rejected / held last good | 304 |
-| Warnings | 144 |
+| Warnings | 1,327 |
 | Zero-load rows accepted | 39,595 |
 
 Merged parser/playback (`script.js` + validation module, as used by the app):
@@ -327,7 +335,7 @@ Merged parser/playback (`script.js` + validation module, as used by the app):
 | Playable rows in source order | 46,797 |
 | Applied / accepted | 46,493 |
 | Final rejected / held | 307 |
-| Warnings | 142 |
+| Warnings | 1,325 |
 
 Rejected rows by category:
 
@@ -340,9 +348,9 @@ Rejected rows by category:
 | Duplicate source timestamp | 1 | 33589 | Duplicate of line 33588; withheld in source order |
 | Documented-bit cross-channel contradiction | 1 | 24671 | Overload bit set with implausibly low moment/load; withheld by the Cycle 3 cross-channel check |
 
-Counters (`store.getCounts()`) count unique rows by `rowId` (CSV line number); replaying a row for display revalidates it but does not increment counters or duplicate the anomaly list. `byRule` counts affected *rows* per rule, while `reasonHits` counts individual findings; a row that trips two rules counts once in each. Module-only rule hits: `checkRadiusRange` 301 · `checkHookHeightRange` 301 · `checkSlewRange` 139 · `checkPhysicalJump` 6 rows / 8 reasons · `checkTimestamp` 2 rows / 3 reasons · `checkLoadRange` 1 · `checkFiniteValues` 1 · `checkWindRange` 0 · `checkAuxiliaryFields` 0. The merged store additionally counts the three Cycle 3 withholdings exactly once, so its totals are 46,493 accepted / 307 rejected / 142 warnings. The 300 dropout rows trip radius and hook together, which is why `byRule` sums to more than the row count.
+Counters (`store.getCounts()`) count unique rows by `rowId` (CSV line number); replaying a row for display revalidates it but does not increment counters or duplicate the anomaly list. `byRule` counts affected *rows* per rule, while `reasonHits` counts individual findings; a row that trips two rules counts once in each. Module-only rule hits: `checkMotionBitConsistency` 1,210 · `checkRadiusRange` 301 · `checkHookHeightRange` 301 · `checkSlewRange` 139 · `checkPhysicalJump` 6 rows / 8 reasons · `checkTimestamp` 2 rows / 3 reasons · `checkLoadRange` 1 · `checkFiniteValues` 1 · `checkWindRange` 0 · `checkAuxiliaryFields` 0 · `checkReverseDirection` 0. The merged store additionally counts the three Cycle 3 withholdings exactly once, so its totals are 46,493 accepted / 307 rejected / 1,325 warnings. The 300 dropout rows trip radius and hook together, which is why `byRule` sums to more than the row count.
 
-Warnings in the merged run: 139 slew boundary overshoots (readings of ±180.1°/180.2°) and 3 jump-only review warnings. The module's two timestamp warnings are the duplicate/backwards rows at lines 28944 and 33589, which the merged playback policy withholds as final rejections. These rows and their immediate neighbours are the only departures from the 1 Hz cadence in the file (four non-1000 ms gaps in total); every other consecutive timestamp gap is exactly 1000 ms.
+Warnings in the merged run: 139 slew boundary overshoots (readings of ±180.1°/180.2°) and 3 jump-only review warnings. The module's two timestamp warnings are the duplicate/backwards rows at lines 28944 and 33589, which the merged playback policy withholds as final rejections. The new `checkMotionBitConsistency` check generates 1,183 warnings (mostly "measured movement present but motion bit not set" because the synthetic dataset has status_word=0 for most rows while actual movement occurs). `checkReverseDirection` generates 0 warnings in this dataset (no limit switch bits set to compare against). These rows and their immediate neighbours are the only departures from the 1 Hz cadence in the file (four non-1000 ms gaps in total); every other consecutive timestamp gap is exactly 1000 ms.
 
 ### First three physically impossible rows
 

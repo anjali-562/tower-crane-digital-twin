@@ -43,6 +43,15 @@
  * headroom (5 m/s, 3 m/s, 10 °/s). The check scales by elapsed time (Δt), so a
  * 3 m radius change in 2 s is 1.5 m/s and passes; it does not assume 1 Hz.
  *
+ * Motion-bit consistency and reverse-direction checks use documented DRM 3400
+ * status_word bits only. Tolerances are SIMULATION HEURISTICS derived from the
+ * dataset, NOT certified crane limits. No manufacturer speed limits are supplied.
+ *
+ * Loss event grouping: consecutive invalid (REJECT) rows are grouped into a
+ * single loss event with start/end timestamps and row count. A new event starts
+ * after a gap of LOSS_EVENT_MIN_GAP_MS (default 2000 ms) or when a valid row
+ * is accepted.
+ *
  * NOT a certified safety system. Prototype study aid only.
  *
  * file:// compatible: plain script, no modules, no dependencies. Exposes the
@@ -81,6 +90,39 @@ var JUMP_SLEW_RATE_DPS = 10;   // normal observed max 4.2 °/s
 var STATUS_MASK_MAX = 0x1FFF;  // bits 0..12 documented in README §3
 var RECENT_CAP = 50;
 var KNOWN_EVENTS = { '': true, 'OVERLOAD_WARN': true, 'WIND_ALERT': true, 'LS_TRIP': true };
+
+// Documented DRM 3400 status_word bits (README-for-students.md §3)
+var STATUS_BITS = {
+  hoist: 0x0001,
+  trolley: 0x0002,
+  slew: 0x0004,
+  utilisation: 0x0008,
+  wind: 0x0040,
+  overload: 0x0080,
+  lsTrolleyOut: 0x0100,
+  lsTrolleyIn: 0x0200,
+  lsHookDown: 0x0400,
+  lsHookUp: 0x0800,
+  testMode: 0x1000
+};
+
+// Motion-bit consistency: tolerance for considering motion "present" vs "absent"
+// These are SIMULATION HEURISTICS derived from the dataset, NOT certified crane limits.
+var MOTION_TOLERANCE = {
+  radiusM: 0.05,    // minimum radius change to consider "moving" (m)
+  hookM: 0.05,      // minimum hook height change to consider "moving" (m)
+  slewDeg: 0.1      // minimum slew change to consider "moving" (°)
+};
+
+// Reverse-direction: tolerance for direction disagreement (° or m/s)
+var REVERSE_TOLERANCE = {
+  radiusMps: 0.1,   // speed threshold to establish direction (m/s)
+  hookMps: 0.1,     // speed threshold to establish direction (m/s)
+  slewDps: 0.5      // slew rate threshold to establish direction (°/s)
+};
+
+// Loss event grouping
+var LOSS_EVENT_MIN_GAP_MS = 2000; // gap between invalid rows to start new event (ms)
 
 function isNum(x) { return typeof x === 'number' && isFinite(x); }
 
@@ -396,6 +438,149 @@ function checkPhysicalJump(row, prev) {
   return out;
 }
 
+/* 8. Motion-bit consistency: compare status_word motion bits with measured motion.
+ * Bits: hoist (0x0001), trolley (0x0002), slew (0x0004).
+ * WARN if motion bit set but measured change below tolerance, or vice versa.
+ * REJECT if contradictory bits set simultaneously (e.g., hoist up + hoist down). */
+function checkMotionBitConsistency(row, prev) {
+  if (!prev) return [];
+  if (!isNum(row.status_word)) return [];
+  if (!isNum(row.radius_m) || !isNum(prev.radius_m) ||
+      !isNum(row.hook_height_m) || !isNum(prev.hook_height_m) ||
+      !isNum(row.slew_deg) || !isNum(prev.slew_deg)) return [];
+
+  var sw = row.status_word >>> 0;
+  var hoistBit = (sw & STATUS_BITS.hoist) !== 0;
+  var trolleyBit = (sw & STATUS_BITS.trolley) !== 0;
+  var slewBit = (sw & STATUS_BITS.slew) !== 0;
+  var lsHookUp = (sw & STATUS_BITS.lsHookUp) !== 0;
+  var lsHookDown = (sw & STATUS_BITS.lsHookDown) !== 0;
+  var lsTrolleyOut = (sw & STATUS_BITS.lsTrolleyOut) !== 0;
+  var lsTrolleyIn = (sw & STATUS_BITS.lsTrolleyIn) !== 0;
+
+  var out = [];
+
+  // Conflicting limit switches (mutually exclusive)
+  if (lsHookUp && lsHookDown) {
+    out.push(finding('checkMotionBitConsistency', 'reject',
+      'Conflicting limit switches: lsHookUp and lsHookDown both set'));
+  }
+  if (lsTrolleyOut && lsTrolleyIn) {
+    out.push(finding('checkMotionBitConsistency', 'reject',
+      'Conflicting limit switches: lsTrolleyOut and lsTrolleyIn both set'));
+  }
+
+  // Need previous row to compute measured motion
+  var dr = row.radius_m - prev.radius_m;
+  var dh = row.hook_height_m - prev.hook_height_m;
+  var rawDs = row.slew_deg - prev.slew_deg;
+  if (rawDs > 180) rawDs -= 360;
+  else if (rawDs < -180) rawDs += 360;
+
+  var radiusMoving = Math.abs(dr) > MOTION_TOLERANCE.radiusM;
+  var hookMoving = Math.abs(dh) > MOTION_TOLERANCE.hookM;
+  var slewMoving = Math.abs(rawDs) > MOTION_TOLERANCE.slewDeg;
+
+  // Motion bit indicates movement but measured motion absent
+  if (trolleyBit && !radiusMoving) {
+    out.push(finding('checkMotionBitConsistency', 'warn',
+      'Trolley motion bit set but radius change ' + dr.toFixed(3) + ' m below tolerance ' +
+      MOTION_TOLERANCE.radiusM + ' m'));
+  }
+  if (hoistBit && !hookMoving) {
+    out.push(finding('checkMotionBitConsistency', 'warn',
+      'Hoist motion bit set but hook height change ' + dh.toFixed(3) + ' m below tolerance ' +
+      MOTION_TOLERANCE.hookM + ' m'));
+  }
+  if (slewBit && !slewMoving) {
+    out.push(finding('checkMotionBitConsistency', 'warn',
+      'Slew motion bit set but slew change ' + rawDs.toFixed(3) + '° below tolerance ' +
+      MOTION_TOLERANCE.slewDeg + '°'));
+  }
+
+  // Measured movement present but motion bit not set
+  if (!trolleyBit && radiusMoving) {
+    out.push(finding('checkMotionBitConsistency', 'warn',
+      'Radius change ' + dr.toFixed(3) + ' m detected but trolley motion bit not set'));
+  }
+  if (!hoistBit && hookMoving) {
+    out.push(finding('checkMotionBitConsistency', 'warn',
+      'Hook height change ' + dh.toFixed(3) + ' m detected but hoist motion bit not set'));
+  }
+  if (!slewBit && slewMoving) {
+    out.push(finding('checkMotionBitConsistency', 'warn',
+      'Slew change ' + rawDs.toFixed(3) + '° detected but slew motion bit not set'));
+  }
+
+  return out;
+}
+
+/* 9. Reverse-direction checks: compare motion bit direction with measured direction.
+ * Only meaningful when both bit and measured motion indicate movement.
+ * Uses REVERSE_TOLERANCE thresholds to avoid flagging sensor noise. */
+function checkReverseDirection(row, prev) {
+  if (!prev) return [];
+  if (!isNum(row.status_word)) return [];
+  if (!isNum(row.radius_m) || !isNum(prev.radius_m) ||
+      !isNum(row.hook_height_m) || !isNum(prev.hook_height_m) ||
+      !isNum(row.slew_deg) || !isNum(prev.slew_deg)) return [];
+
+  var sw = row.status_word >>> 0;
+  var hoistBit = (sw & STATUS_BITS.hoist) !== 0;
+  var trolleyBit = (sw & STATUS_BITS.trolley) !== 0;
+  var slewBit = (sw & STATUS_BITS.slew) !== 0;
+  var lsHookUp = (sw & STATUS_BITS.lsHookUp) !== 0;
+  var lsHookDown = (sw & STATUS_BITS.lsHookDown) !== 0;
+  var lsTrolleyOut = (sw & STATUS_BITS.lsTrolleyOut) !== 0;
+  var lsTrolleyIn = (sw & STATUS_BITS.lsTrolleyIn) !== 0;
+
+  var out = [];
+
+  // Need timestamps to compute rates
+  var a = parseTimestampStrict(row.ts);
+  var b = parseTimestampStrict(prev.ts);
+  if (!a.ok || !b.ok) return out;
+  var dtS = (a.ms - b.ms) / 1000;
+  if (!(dtS > 0)) return out;
+
+  var dr = row.radius_m - prev.radius_m;
+  var dh = row.hook_height_m - prev.hook_height_m;
+  var rawDs = row.slew_deg - prev.slew_deg;
+  if (rawDs > 180) rawDs -= 360;
+  else if (rawDs < -180) rawDs += 360;
+
+  var radiusRate = dr / dtS;
+  var hookRate = dh / dtS;
+  var slewRate = rawDs / dtS;
+
+  // Hoist: lsHookUp means hook going up (positive dh), lsHookDown means down (negative dh)
+  if (hoistBit && Math.abs(hookRate) > REVERSE_TOLERANCE.hookMps) {
+    var hookDir = hookRate > 0 ? 'up' : 'down';
+    var bitDir = lsHookUp ? 'up' : (lsHookDown ? 'down' : 'unknown');
+    if (bitDir !== 'unknown' && hookDir !== bitDir) {
+      out.push(finding('checkReverseDirection', 'warn',
+        'Hoist reverse-direction: motion bit indicates ' + bitDir +
+        ' but measured hook rate ' + hookRate.toFixed(2) + ' m/s indicates ' + hookDir));
+    }
+  }
+
+  // Trolley: lsTrolleyOut means radius increasing (positive dr), lsTrolleyIn means decreasing
+  if (trolleyBit && Math.abs(radiusRate) > REVERSE_TOLERANCE.radiusMps) {
+    var radiusDir = radiusRate > 0 ? 'out' : 'in';
+    var bitDir = lsTrolleyOut ? 'out' : (lsTrolleyIn ? 'in' : 'unknown');
+    if (bitDir !== 'unknown' && radiusDir !== bitDir) {
+      out.push(finding('checkReverseDirection', 'warn',
+        'Trolley reverse-direction: motion bit indicates ' + bitDir +
+        ' but measured radius rate ' + radiusRate.toFixed(2) + ' m/s indicates ' + radiusDir));
+    }
+  }
+
+  // Slew: direction from slew rate (positive = CCW, negative = CW)
+  // No dedicated slew limit switch bits in documented schema; skip bit comparison
+
+  return out;
+}
+
 /* Run all checks in device order. ctx: { seen:{}, lastMs, prev } — the store
  * threads this through; direct callers may pass {} or omit it.
  * Returns { valid, severity, reasons, findings, row, timestamp, timestampMs }.
@@ -414,6 +599,8 @@ function validateRow(row, ctx) {
   fs = fs.concat(checkSlewRange(row));
   fs = fs.concat(checkTimestamp(row, c));
   fs = fs.concat(checkPhysicalJump(row, c.prev || null));
+  fs = fs.concat(checkMotionBitConsistency(row, c.prev || null));
+  fs = fs.concat(checkReverseDirection(row, c.prev || null));
   var severity = 'ok';
   for (var i = 0; i < fs.length; i++) {
     if (fs[i].severity === 'reject') { severity = 'reject'; break; }
@@ -432,7 +619,7 @@ function validateRow(row, ctx) {
   };
 }
 
-/* Store: last-good state + data-quality counters + recent anomalies.
+/* Store: last-good state + data-quality counters + recent anomalies + loss events.
  *
  * Counters count UNIQUE ROWS when the caller supplies a stable rowId (CSV line
  * number — REQUIRED for honest counts), otherwise they count handling events.
@@ -442,6 +629,13 @@ function validateRow(row, ctx) {
  *
  * Counters are dataset-level: they are populated by a full-file validation
  * pass and do not increase again when playback revisits a row.
+ *
+ * Loss events: consecutive REJECT rows are grouped into single loss events.
+ * Each loss event has: startTs, endTs, startLine, endLine, rowCount, firstReason.
+ * A new loss event starts when:
+ *   - The first REJECT row is encountered
+ *   - A gap of > LOSS_EVENT_MIN_GAP_MS between consecutive REJECT rows
+ *   - A valid (OK/WARN) row breaks the consecutive REJECT sequence
  */
 function createStore() {
   var store = {
@@ -459,6 +653,10 @@ function createStore() {
     _seenTs: {},
     _lastMs: null,
     _prev: null,
+    // Loss event tracking
+    _currentLossEvent: null,
+    _lossEvents: [],
+    _lastRejectTsMs: null,
 
     handle: function (rawOrParsed, opts) {
       var o = opts || {};
@@ -479,6 +677,53 @@ function createStore() {
       res.line = parsed.csvLine !== undefined ? parsed.csvLine : null;
       res.counted = fresh;
       res.action = res.valid ? (res.severity === 'warn' ? 'accept-warn' : 'accept') : 'reject-hold';
+
+      // Loss event grouping for consecutive REJECT rows
+      if (fresh && !res.valid) {
+        var rejectTsMs = res.timestampMs;
+        var startNewEvent = false;
+        if (!this._currentLossEvent) {
+          startNewEvent = true;
+        } else if (!isNum(this._lastRejectTsMs) || !isNum(rejectTsMs) ||
+                   (rejectTsMs - this._lastRejectTsMs) > LOSS_EVENT_MIN_GAP_MS) {
+          startNewEvent = true;
+        }
+        if (startNewEvent) {
+          // Close previous event if exists
+          if (this._currentLossEvent) {
+            this._lossEvents.push(this._currentLossEvent);
+            if (this._lossEvents.length > RECENT_CAP) this._lossEvents.shift();
+          }
+          // Start new loss event
+          this._currentLossEvent = {
+            startTs: parsed.ts,
+            startTsMs: rejectTsMs,
+            startLine: res.line,
+            endTs: parsed.ts,
+            endTsMs: rejectTsMs,
+            endLine: res.line,
+            rowCount: 1,
+            firstReason: res.reasons[0] || 'unknown',
+            reasons: [res.reasons.slice()]
+          };
+        } else {
+          // Extend current loss event
+          this._currentLossEvent.endTs = parsed.ts;
+          this._currentLossEvent.endTsMs = rejectTsMs;
+          this._currentLossEvent.endLine = res.line;
+          this._currentLossEvent.rowCount++;
+          this._currentLossEvent.reasons.push(res.reasons.slice());
+        }
+        this._lastRejectTsMs = rejectTsMs;
+      } else if (fresh && res.valid) {
+        // Valid row breaks any ongoing loss event
+        if (this._currentLossEvent) {
+          this._lossEvents.push(this._currentLossEvent);
+          if (this._lossEvents.length > RECENT_CAP) this._lossEvents.shift();
+          this._currentLossEvent = null;
+          this._lastRejectTsMs = null;
+        }
+      }
 
       if (fresh) {
         this.total++;
@@ -532,11 +777,18 @@ function createStore() {
       if (n === undefined || n === null) return this.recent.slice();
       return this.recent.slice(0, n);
     },
+    getLossEvents: function (n) {
+      var events = this._lossEvents.slice();
+      if (this._currentLossEvent) events.push(this._currentLossEvent);
+      if (n === undefined || n === null) return events;
+      return events.slice(-n);
+    },
     reset: function () {
       this.lastGood = null; this.total = 0; this.accepted = 0; this.rejected = 0;
       this.held = 0; this.warnings = 0; this.byRule = {}; this.reasonHits = {};
       this.lastResult = null; this.recent = []; this._counted = {};
       this._seenTs = {}; this._lastMs = null; this._prev = null;
+      this._currentLossEvent = null; this._lossEvents = []; this._lastRejectTsMs = null;
     },
   };
   return store;
@@ -645,6 +897,11 @@ return {
   JUMP_RADIUS_WARN_M: JUMP_RADIUS_RATE_MPS,
   JUMP_HOOK_WARN_M: JUMP_HOOK_RATE_MPS,
   JUMP_SLEW_WARN_DEG: JUMP_SLEW_RATE_DPS,
+  // Motion-bit and reverse-direction thresholds (SIMULATION HEURISTICS).
+  MOTION_TOLERANCE: MOTION_TOLERANCE,
+  REVERSE_TOLERANCE: REVERSE_TOLERANCE,
+  LOSS_EVENT_MIN_GAP_MS: LOSS_EVENT_MIN_GAP_MS,
+  STATUS_BITS: STATUS_BITS,
   parseTimestampStrict: parseTimestampStrict,
   parseRow: parseRow,
   checkFiniteValues: checkFiniteValues,
@@ -656,6 +913,8 @@ return {
   checkSlewRange: checkSlewRange,
   checkTimestamp: checkTimestamp,
   checkPhysicalJump: checkPhysicalJump,
+  checkMotionBitConsistency: checkMotionBitConsistency,
+  checkReverseDirection: checkReverseDirection,
   validateRow: validateRow,
   createStore: createStore,
   createPlaybackSession: createPlaybackSession,

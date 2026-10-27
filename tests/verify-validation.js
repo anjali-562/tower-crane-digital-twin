@@ -27,6 +27,15 @@ function mkRow(over) {
     status_word: '0', event: '',
   }, over || {}));
 }
+function mkRowWithMotion(over) {
+  // status_word with hoist(1) + trolley(2) + slew(4) = 7
+  return TV.parseRow(Object.assign({
+    ts: '2026-09-15T06:00:00+05:30', imei: '000000000000001',
+    load_t: '1.00', radius_m: '20.00', slew_deg: '45.0',
+    hook_height_m: '24.00', wind_kmh: '8.0', moment_pct: '24.7',
+    status_word: '7', event: '',
+  }, over || {}));
+}
 function hasRule(res, rule) { return res.reasons.some((r) => r.indexOf(rule) === 0); }
 function hasRuleSeverity(res, rule, sev) {
   return res.findings.some((f) => f.rule === rule && f.severity === sev);
@@ -105,9 +114,10 @@ var hHi = TV.validateRow(mkRow({ hook_height_m: '47.00' }), {});
 check(hHi.valid === false && hasRule(hHi, 'checkHookHeightRange'), '6b. hook 47.00 m -> reject by checkHookHeightRange');
 
 // 7. Slew range and wraparound
-var wrap = TV.validateRow(mkRow({ slew_deg: '-179.0' }), { prev: mkRow({ slew_deg: '179.0' }) });
-check(wrap.valid === true && wrap.severity === 'ok' && !hasRule(wrap, 'checkPhysicalJump'),
-  '7a. wraparound +179 -> -179 -> valid/ok, no false jump warning');
+// Use only slew motion bit (0x0004 = 4) for slew-only tests
+var wrap = TV.validateRow(mkRowWithMotion({ slew_deg: '-179.0', status_word: '4' }), { prev: mkRowWithMotion({ slew_deg: '179.0', status_word: '4' }) });
+check(wrap.valid === true && wrap.severity === 'ok' && !hasRule(wrap, 'checkPhysicalJump') && !hasRule(wrap, 'checkMotionBitConsistency'),
+  '7a. wraparound +179 -> -179 -> valid/ok, no false jump/motion-bit warning');
 var over1 = TV.validateRow(mkRow({ slew_deg: '180.1' }), {});
 check(over1.valid === true && over1.severity === 'warn' && hasRule(over1, 'checkSlewRange'), '7b. slew 180.1 (small overshoot) -> warn only');
 var overBig = TV.validateRow(mkRow({ slew_deg: '185.0' }), {});
@@ -134,19 +144,21 @@ var a = Date.parse('2026-09-15T06:00:00+05:30'), b = Date.parse('2026-09-15T00:3
 check(a === b, '8g. +05:30 offset honoured: 06:00+05:30 === 00:30Z');
 
 // 9. Physical-jump heuristic: WARN only and scaled by elapsed time
-var jump = TV.validateRow(mkRow({ ts: '2026-09-15T06:00:01+05:30', radius_m: '20.00' }),
-  { prev: mkRow({ ts: '2026-09-15T06:00:00+05:30', radius_m: '9.60' }) });
+// Use only trolley motion bit (0x0002 = 2) for radius change tests
+var jump = TV.validateRow(mkRowWithMotion({ ts: '2026-09-15T06:00:01+05:30', radius_m: '20.00', status_word: '2' }),
+  { prev: mkRowWithMotion({ ts: '2026-09-15T06:00:00+05:30', radius_m: '9.60', status_word: '2' }) });
 check(jump.valid === true && jump.severity === 'warn' && hasRule(jump, 'checkPhysicalJump'),
   '9a. 10.4 m radius change in 1 s -> warn, stays valid');
-var jumpSlow = TV.validateRow(mkRow({ ts: '2026-09-15T06:00:05+05:30', radius_m: '20.00' }),
-  { prev: mkRow({ ts: '2026-09-15T06:00:00+05:30', radius_m: '9.60' }) });
+var jumpSlow = TV.validateRow(mkRowWithMotion({ ts: '2026-09-15T06:00:05+05:30', radius_m: '20.00', status_word: '2' }),
+  { prev: mkRowWithMotion({ ts: '2026-09-15T06:00:00+05:30', radius_m: '9.60', status_word: '2' }) });
 check(jumpSlow.severity === 'ok' && !hasRule(jumpSlow, 'checkPhysicalJump'),
   '9b. same 10.4 m change in 5 s (2.08 m/s) -> no warning (elapsed time used)');
-var slewFast = TV.validateRow(mkRow({ ts: '2026-09-15T06:00:01+05:30', slew_deg: '45.0' }),
-  { prev: mkRow({ ts: '2026-09-15T06:00:00+05:30', slew_deg: '30.0' }) });
+// Use only slew motion bit (0x0004 = 4) for slew change tests
+var slewFast = TV.validateRow(mkRowWithMotion({ ts: '2026-09-15T06:00:01+05:30', slew_deg: '45.0', status_word: '4' }),
+  { prev: mkRowWithMotion({ ts: '2026-09-15T06:00:00+05:30', slew_deg: '30.0', status_word: '4' }) });
 check(slewFast.severity === 'warn' && hasRule(slewFast, 'checkPhysicalJump'), '9c. 15° slew in 1 s -> warn');
-var slewSlow = TV.validateRow(mkRow({ ts: '2026-09-15T06:00:03+05:30', slew_deg: '45.0' }),
-  { prev: mkRow({ ts: '2026-09-15T06:00:00+05:30', slew_deg: '30.0' }) });
+var slewSlow = TV.validateRow(mkRowWithMotion({ ts: '2026-09-15T06:00:03+05:30', slew_deg: '45.0', status_word: '4' }),
+  { prev: mkRowWithMotion({ ts: '2026-09-15T06:00:00+05:30', slew_deg: '30.0', status_word: '4' }) });
 check(slewSlow.severity === 'ok' && !hasRule(slewSlow, 'checkPhysicalJump'), '9d. same 15° slew in 3 s (5 °/s) -> no warning');
 
 // 10. Store: hold last good, warnings, counters, stable row IDs
@@ -256,7 +268,7 @@ var csv = csvBuf.toString('utf8').split(/\r?\n/);
 var s2 = TV.createStore();
 var firstRejects = [];
 var catSpike = 0, catMissing = 0, catDropout = 0, accZeroLoad = 0;
-var warnSlew = 0, warnJump = 0, warnTs = 0;
+var warnSlew = 0, warnJump = 0, warnTs = 0, warnMotionBit = 0, warnReverse = 0;
 var lineMap = {};
 for (var i = 1; i < csv.length; i++) {
   var line = csv[i];
@@ -282,6 +294,8 @@ for (var i = 1; i < csv.length; i++) {
     if (rules.indexOf('checkSlewRange') !== -1) warnSlew++;
     else if (rules.indexOf('checkPhysicalJump') !== -1) warnJump++;
     else if (rules.indexOf('checkTimestamp') !== -1) warnTs++;
+    else if (rules.indexOf('checkMotionBitConsistency') !== -1) warnMotionBit++;
+    else if (rules.indexOf('checkReverseDirection') !== -1) warnReverse++;
   }
 }
 var totals = s2.getCounts();
@@ -298,17 +312,17 @@ check(firstRejects[2] && firstRejects[2].line === 14285 && firstRejects[2].ts ==
 check(catSpike === 3 && catMissing === 1 && catDropout === 300,
   '12f. reject categories row-exclusive: spikes=' + catSpike + ' missing=' + catMissing + ' dropout=' + catDropout);
 check(totals.total === 46800 && totals.accepted === 46496 && totals.rejected === 304 &&
-  totals.held === 304 && totals.warnings === 144,
-  '12g. full-file totals: 46800 / 46496 accepted / 304 rejected / 304 held / 144 warnings (got ' + JSON.stringify(totals) + ')');
-check(totals.byRule.checkRadiusRange === 301 && totals.byRule.checkHookHeightRange === 301 &&
+  totals.held === 304 && totals.warnings === 1327,
+  '12g. full-file totals: 46800 / 46496 accepted / 304 rejected / 304 held / 1327 warnings (got ' + JSON.stringify(totals) + ')');
+check(totals.byRule.checkMotionBitConsistency === 1210 && totals.byRule.checkRadiusRange === 301 && totals.byRule.checkHookHeightRange === 301 &&
   totals.byRule.checkSlewRange === 139 && totals.byRule.checkLoadRange === 1 &&
   totals.byRule.checkFiniteValues === 1 && totals.byRule.checkTimestamp === 2 &&
   totals.byRule.checkPhysicalJump === 6,
   '12h. byRule row counts match the dataset (overlaps counted once per rule)');
-check(totals.reasonHits.checkPhysicalJump === 8 && totals.reasonHits.checkTimestamp === 3,
+check(totals.reasonHits.checkMotionBitConsistency === 1214 && totals.reasonHits.checkPhysicalJump === 8 && totals.reasonHits.checkTimestamp === 3,
   '12i. reasonHits distinguishes individual reasons from affected rows');
-check(warnSlew === 139 && warnJump === 3 && warnTs === 2,
-  '12j. warning rows by category: slew=139 jump=3 timestamp=2 (total 144)');
+check(warnSlew === 139 && warnJump === 3 && warnTs === 2 && warnMotionBit === 1183 && warnReverse === 0,
+  '12j. warning rows by category: slew=139 jump=3 timestamp=2 motion-bit=1183 reverse=0 (total 1327)');
 check(lineMap[42933] && lineMap[42933].valid === false &&
   lineMap[42933].findings.some(function (f) { return f.rule === 'checkFiniteValues'; }),
   '12k. line 42933 missing load_t -> rejected, not defaulted to 0');

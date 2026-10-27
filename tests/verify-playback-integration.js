@@ -51,8 +51,8 @@ vm.runInContext(parserDeps + '\n' + parserSource + '\nthis.parseTelemetryCSV = p
 const rows = sandbox.parseTelemetryCSV(fs.readFileSync(csvPath, 'utf8'));
 check(rows.length === 46797, '1b. parser returns 46,797 playable rows (2 chronology rejects + 1 legacy reject omitted; got ' + rows.length + ')');
 const counts = T.validationStore.getCounts();
-check(counts.total === 46800 && counts.accepted === 46493 && counts.rejected === 307 && counts.warnings === 142,
-  '1c. parser attaches dataset validation: 46800 / 46493 accepted / 307 rejected / 142 warnings');
+check(counts.total === 46800 && counts.accepted === 46493 && counts.rejected === 307 && counts.warnings === 1325,
+  '1c. parser attaches dataset validation: 46800 / 46493 accepted / 307 rejected / 1325 warnings');
 
 // 2. Consume the actual parsed rows through a playback session with a fake
 // state applier. Rejected rows must never reach the applier.
