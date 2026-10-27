@@ -94,12 +94,16 @@ window.TelemetryAPI = {
   getCurrentTelemetryRow,
   getDeviceMomentPct,
   getComputedUtilization,
+  getDivergenceDisplayState,
   getValidationState: () => ({
     total: T.validationStore ? T.validationStore.total : 0,
     accepted: T.validationStore ? T.validationStore.accepted : 0,
     rejected: T.validationStore ? T.validationStore.rejected : 0,
     held: T.validationStore ? T.validationStore.held : 0,
     warnings: T.validationStore ? T.validationStore.warnings : 0,
+    withheld: T.validationStore ? (T.validationStore.withheld || 0) : 0,
+    loss: T.validationStore && typeof T.validationStore.getLossSummary === 'function'
+      ? T.validationStore.getLossSummary() : null,
     byRule: T.validationStore ? Object.assign({}, T.validationStore.byRule) : {}
   }),
   getTelemetryState: () => ({
@@ -362,6 +366,15 @@ function markStoreRejected(store, res, reason, row, line) {
   if (res.severity === 'warn') store.warnings = Math.max(0, (store.warnings || 0) - 1);
   store.rejected = (store.rejected || 0) + 1;
   store.held = (store.held || 0) + 1;
+  // These rows were accepted by the module and removed before playback, not
+  // part of a playback loss episode. The parser rebuilds loss episodes from
+  // the final playable sequence after marking all withheld rows, so a withheld
+  // row cannot become a false recovery or split a run.
+  if (typeof store.withholdAccepted === 'function') {
+    store.withholdAccepted(res);
+  } else {
+    store.withheld = (store.withheld || 0) + 1;
+  }
   store.byRule[reason] = (store.byRule[reason] || 0) + 1;
   store.reasonHits[reason] = (store.reasonHits[reason] || 0) + 1;
   res.valid = false;
@@ -521,6 +534,13 @@ function parseTelemetryCSV(csvText) {
     if (typeof T !== 'undefined' && T.onRowParsed) T.onRowParsed(r, rows.length - 1);
   }
 
+  // Validation handled every source row before the parser withheld any. Rebuild
+  // loss episodes from the final playable rows so withheld rows are invisible
+  // to loss grouping and cannot become false recovery samples.
+  if (validationStore && typeof validationStore.rebuildLossEpisodes === 'function') {
+    validationStore.rebuildLossEpisodes(rows);
+  }
+
   if (typeof T !== 'undefined') {
     let sourceEndTsMs = null;
     for (let i = 0; i < allParsed.length; i++) {
@@ -585,7 +605,13 @@ function ensurePlaybackSession() {
 
 function updateValidationPanel() {
   if (!T.validationStore || typeof TelemetryValidation === 'undefined') return;
-  TelemetryValidation.renderCounterPanel(T.validationStore, document, T.lastValidation || null)
+  const validationState = (typeof window !== 'undefined' && window.TelemetryAPI &&
+    typeof window.TelemetryAPI.getValidationState === 'function')
+    ? window.TelemetryAPI.getValidationState()
+    : null;
+  TelemetryValidation.renderCounterPanel(
+    T.validationStore, document, T.lastValidation || null, validationState
+  );
 }
 
 function telemetryTick(nowMs) {
@@ -1458,6 +1484,21 @@ function updateUI() {
   updateDivergenceBadge();
 }
 
+/* Display-state resolver for the divergence badge. COMPLETE takes precedence
+ * over STALE because completion also sets the stale flag. Stale is a state,
+ * not a timeout: the existing telemetryTick()/isTelemetryStale() policy sets
+ * T.stale while the last accepted row is still retained. A fresh accepted row
+ * clears both flags and returns the badge to normal comparison mode. */
+function getDivergenceDisplayState(Tstate) {
+  const state = Tstate || null;
+  if (!state || state.mode !== 'live') return 'hidden';
+  const hasTelemetry = (state.rows && state.rows.length > 0) || !!state.lastAcceptedRow;
+  if (!hasTelemetry) return 'hidden';
+  if (state.complete) return 'complete';
+  if (state.stale) return 'stale';
+  return 'normal';
+}
+
 function updateDivergenceBadge() {
   if (typeof $ !== 'function') return;
   const divBlock = $('divergenceBlock');
@@ -1468,21 +1509,33 @@ function updateDivergenceBadge() {
   const divReason = $('divReason');
   if (!divBlock || !divDevice || !divComputed || !divDiff || !divBadge || !divReason) return;
 
-  // Only show in LIVE mode with telemetry loaded
-  if (T.mode !== 'live' || (T.rows.length === 0 && !T.lastAcceptedRow)) {
+  const displayState = getDivergenceDisplayState(T);
+  if (displayState === 'hidden') {
     divBlock.style.display = 'none';
     return;
   }
   divBlock.style.display = 'block';
 
-  const row = getCurrentTelemetryRow();
-  if (!row || (T.stale && !T.lastAcceptedRow)) {
+  if (displayState === 'stale' || displayState === 'complete') {
     divDevice.textContent = '—';
     divComputed.textContent = '—';
     divDiff.textContent = '—';
-    divBadge.textContent = T.complete ? 'COMPLETE' : 'STALE';
+    divBadge.textContent = displayState === 'complete' ? 'COMPLETE' : 'STALE';
     divBadge.className = 'div-badge div-invalid';
-    divReason.textContent = T.complete ? 'Playback complete — holding last accepted sample' : 'Telemetry missing or lost — holding last accepted sample';
+    divReason.textContent = displayState === 'complete'
+      ? 'Playback complete — holding last accepted sample'
+      : 'Telemetry stale or lost — holding last accepted sample';
+    return;
+  }
+
+  const row = getCurrentTelemetryRow();
+  if (!row) {
+    divDevice.textContent = '—';
+    divComputed.textContent = '—';
+    divDiff.textContent = '—';
+    divBadge.textContent = 'UNAVAILABLE';
+    divBadge.className = 'div-badge div-invalid';
+    divReason.textContent = 'No accepted telemetry sample available';
     return;
   }
 
@@ -1509,9 +1562,9 @@ function updateDivergenceBadge() {
   divDiff.textContent = window.DivergenceAPI.formatPct ? window.DivergenceAPI.formatPct(result.divergencePct) : (result.divergencePct == null ? '—' : result.divergencePct.toFixed(1) + '%');
 
   if (result.status === 'invalid') {
-    divBadge.textContent = T.complete ? 'COMPLETE' : (T.stale ? 'STALE' : 'UNAVAILABLE');
+    divBadge.textContent = 'UNAVAILABLE';
     divBadge.className = 'div-badge div-invalid';
-    divReason.textContent = T.complete ? 'Playback complete — holding last accepted sample' : (T.stale ? 'Telemetry missing or lost — holding last accepted sample' : (result.reason || 'Invalid or missing data'));
+    divReason.textContent = result.reason || 'Invalid or missing data';
   } else {
     divBadge.textContent = window.DivergenceAPI.getStatusText ? window.DivergenceAPI.getStatusText(result.status) : result.status.toUpperCase();
     divBadge.className = 'div-badge ' + (window.DivergenceAPI.getStatusClass ? window.DivergenceAPI.getStatusClass(result.status) : 'div-ok');
